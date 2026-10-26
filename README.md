@@ -1,4 +1,4 @@
-# WinCrow
+# WinCrow V1.2.5
 
 **Scavenge the bloat. Leave only bones.**
 
