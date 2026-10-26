@@ -6,6 +6,8 @@
     * Removes bloated Store apps (pick from a list)
     * Enables / disables startup apps (pick from a list)
     * 40+ privacy, performance and interface tweaks, each one reversible
+    * Cleaner (temp files, browser and app caches), registry cleaner with backups,
+      leftover finder, and an update check against github.com/tasmon/WinCrow
     * Dark and light themes
     * First launch installs itself to "C:\Program Files\WinCrow" and adds a
       Start menu shortcut. After that, launch it from the Start menu.
@@ -28,13 +30,20 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference    = 'SilentlyContinue'
 
 $AppName      = 'WinCrow'
-$AppVersion   = '1.1.0'
+$AppVersion   = '1.2.0'
+$RepoOwner    = 'tasmon'
+$RepoName     = 'WinCrow'
+$RepoUrl      = "https://github.com/$RepoOwner/$RepoName"
 $DevName      = 'Tasmon Islam'
 $DevEmail     = 'tasmon@outlook.com'
 $InstallDir   = Join-Path $env:ProgramFiles $AppName
 $LogDir       = Join-Path $InstallDir 'Logs'
 $IconPath     = Join-Path $InstallDir 'WinCrow.ico'
 $SettingsPath = Join-Path $InstallDir 'settings.json'
+# registry backups and quarantined folders live outside the program folder so updates and uninstalls never delete them
+$DataDir       = Join-Path $env:ProgramData $AppName
+$QuarantineDir = Join-Path $DataDir 'Quarantine'
+$RegBackupRoot = Join-Path $DataDir 'RegBackups'
 $ShortcutPath = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\WinCrow.lnk'
 $PsExe        = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
 
@@ -44,12 +53,16 @@ function Test-Admin {
 }
 
 # Must run as admin in Windows PowerShell 5.1 (the Appx module needs it)
-if (-not (Test-Admin) -or $PSVersionTable.PSEdition -eq 'Core') {
+$native64 = Join-Path $env:SystemRoot 'Sysnative\WindowsPowerShell\v1.0\powershell.exe'
+$wrongBitness = ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess -and (Test-Path -LiteralPath $native64))
+if (-not (Test-Admin) -or $PSVersionTable.PSEdition -eq 'Core' -or $wrongBitness) {
     if (-not $PSCommandPath) { Write-Warning 'Save WinCrow as a .ps1 file and run it from there.'; return }
     $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', "`"$PSCommandPath`"")
     if ($Uninstall) { $argList += '-Uninstall' }
     if ($FirstRun)  { $argList += '-FirstRun' }
-    try { Start-Process -FilePath $PsExe -Verb RunAs -ArgumentList $argList } catch { }
+    $launchExe = $PsExe
+    if ($wrongBitness) { $launchExe = $native64 }
+    try { Start-Process -FilePath $launchExe -Verb RunAs -ArgumentList $argList } catch { }
     return
 }
 
@@ -226,18 +239,20 @@ $Themes = @{
     }
 }
 
-function Get-SavedTheme {
+$script:Settings = @{ Theme = 'Dark'; AutoUpdate = $true }
+function Load-Settings {
     try {
         $s = Get-Content -LiteralPath $SettingsPath -Raw -ErrorAction Stop | ConvertFrom-Json
-        if ($s.Theme -in 'Dark', 'Light') { return [string]$s.Theme }
+        if ($s.Theme -in 'Dark', 'Light') { $script:Settings.Theme = [string]$s.Theme }
+        if ($null -ne $s.AutoUpdate) { $script:Settings.AutoUpdate = [bool]$s.AutoUpdate }
     } catch { }
-    return 'Dark'
 }
-function Save-Theme([string]$Name) {
-    try { (@{ Theme = $Name } | ConvertTo-Json) | Set-Content -LiteralPath $SettingsPath -Encoding ASCII } catch { }
+function Save-Settings {
+    try { ($script:Settings | ConvertTo-Json) | Set-Content -LiteralPath $SettingsPath -Encoding ASCII } catch { }
 }
+Load-Settings
 
-$script:Theme = Get-SavedTheme
+$script:Theme = $script:Settings.Theme
 $C = $Themes[$script:Theme]
 $script:Roles = @{}        # control -> role, so a theme switch can recolor everything
 
@@ -562,6 +577,584 @@ function Test-Tweak($t) {
     return $true
 }
 
+# ====================================================================== SHARED HELPERS
+function Format-Size([double]$Bytes) {
+    if ($Bytes -ge 1GB) { return ('{0:N2} GB' -f ($Bytes / 1GB)) }
+    if ($Bytes -ge 1MB) { return ('{0:N1} MB' -f ($Bytes / 1MB)) }
+    if ($Bytes -ge 1KB) { return ('{0:N0} KB' -f ($Bytes / 1KB)) }
+    if ($Bytes -gt 0)   { return ('{0:N0} B' -f $Bytes) }
+    return '0 KB'
+}
+
+function Wait-ProcUi($Proc) {
+    while (-not $Proc.HasExited) { [Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 150 }
+    $Proc.WaitForExit()    # caches the exit code (Start-Process -PassThru can otherwise return a null ExitCode)
+}
+
+function New-RestorePoint([string]$Desc) {
+    try { Checkpoint-Computer -Description $Desc -RestorePointType MODIFY_SETTINGS -ErrorAction Stop; Write-Log 'Restore point created.' }
+    catch { Write-Log ('Restore point skipped: ' + $_.Exception.Message) 'WARN' }
+}
+
+function Get-NormName([string]$s) { return ($s.ToLower() -replace '[^a-z0-9]', '') }
+
+# ---- registry plumbing (uses the .NET registry API so odd value names are safe)
+$UninstallRoots = @(
+    'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
+    'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall',
+    'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall'
+)
+$RunKeys = @(
+    'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run',
+    'HKLM:\Software\Microsoft\Windows\CurrentVersion\Run',
+    'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Run'
+)
+
+function Split-RegPath([string]$p) {
+    if ($p -match '^(HKLM|HKCU|HKCR|HKU):\\?(.*)$') {
+        $hive = $Matches[1]; $sub = $Matches[2]
+        $root = $null
+        switch ($hive) {
+            'HKLM' { $root = [Microsoft.Win32.Registry]::LocalMachine }
+            'HKCU' { $root = [Microsoft.Win32.Registry]::CurrentUser }
+            'HKCR' { $root = [Microsoft.Win32.Registry]::ClassesRoot }
+            'HKU'  { $root = [Microsoft.Win32.Registry]::Users }
+        }
+        return @{ Root = $root; Sub = $sub }
+    }
+    return $null
+}
+
+function Open-Reg([string]$p, [bool]$Writable = $false) {
+    $s = Split-RegPath $p
+    if (-not $s) { return $null }
+    try { return $s.Root.OpenSubKey($s.Sub, $Writable) } catch { return $null }
+}
+
+# True only when the file is missing on a fixed drive that is present. Unplugged drives, network
+# paths, wildcards and unresolved variables are never reported as missing.
+$script:FixedRoots = $null
+function Test-Missing([string]$Path) {
+    if (-not $Path) { return $false }
+    $p = [Environment]::ExpandEnvironmentVariables($Path.Trim().Trim('"'))
+    if ($p -notmatch '^[A-Za-z]:\\') { return $false }
+    if ($p -match '[*?<>|%]') { return $false }
+    if (-not $script:FixedRoots) {
+        $script:FixedRoots = @([IO.DriveInfo]::GetDrives() | Where-Object { $_.DriveType -eq 'Fixed' -and $_.IsReady } | ForEach-Object { $_.Name.ToUpper() })
+    }
+    if ($script:FixedRoots -notcontains $p.Substring(0, 3).ToUpper()) { return $false }
+    return (-not (Test-Path -LiteralPath $p))
+}
+
+# Pulls the program path out of a command line such as: "C:\x\a.exe" /silent   or   C:\x\a.exe -x
+function Get-CmdFile([string]$Cmd) {
+    if (-not $Cmd) { return $null }
+    $c = [Environment]::ExpandEnvironmentVariables($Cmd.Trim())
+    if ($c.StartsWith('"')) {
+        $e = $c.IndexOf('"', 1)
+        if ($e -gt 1) { $c = $c.Substring(1, $e - 1) } else { return $null }
+        if ($c -match '^[A-Za-z]:\\') { return $c }
+        return $null
+    }
+    if ($c -match '^([A-Za-z]:\\.*?\.(exe|dll|msi|bat|cmd|com|ico|cpl|scr|sys))(\s|,|$)') { return $Matches[1] }
+    return $null
+}
+
+# ====================================================================== CLEANER DATA
+$CleanCats = @('Windows', 'Browsers', 'Applications', 'Privacy traces', 'Advanced')
+$Cleaners = New-Object System.Collections.ArrayList
+function Add-Cl([string]$Cat, [string]$Name, [string]$Desc, [string[]]$Paths, [bool]$On = $true, [string]$Kind = 'Files', [string[]]$Svc = @()) {
+    [void]$script:Cleaners.Add(@{ Cat = $Cat; Name = $Name; Desc = $Desc; Paths = $Paths; On = $On; Kind = $Kind; Svc = $Svc; Bytes = $null })
+}
+
+$LA = $env:LOCALAPPDATA; $RA = $env:APPDATA; $WIN = $env:SystemRoot; $PD = $env:ProgramData
+$ExplorerKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer'
+
+# ---- Windows
+Add-Cl 'Windows' 'User temporary files' 'Leftover files in your Temp folder' @("$env:TEMP\*")
+Add-Cl 'Windows' 'Windows temporary files' 'Leftover files in C:\Windows\Temp' @("$WIN\Temp\*")
+Add-Cl 'Windows' 'Recycle Bin' 'Permanently empties the Recycle Bin on all drives' @() -On $false -Kind 'Recycle'
+Add-Cl 'Windows' 'Thumbnail cache' 'Explorer picture previews (rebuilt when needed)' @("$LA\Microsoft\Windows\Explorer\thumbcache_*.db")
+Add-Cl 'Windows' 'Internet cache (legacy)' 'INetCache used by Internet Explorer mode and older apps' @("$LA\Microsoft\Windows\INetCache\*")
+Add-Cl 'Windows' 'Windows Update download cache' 'Already-installed update packages (SoftwareDistribution\Download)' @("$WIN\SoftwareDistribution\Download\*") -Svc @('wuauserv', 'bits')
+Add-Cl 'Windows' 'Delivery Optimization cache' 'Cached update files shared with other PCs' @("$WIN\ServiceProfiles\NetworkService\AppData\Local\Microsoft\Windows\DeliveryOptimization\Cache\*") -Svc @('dosvc')
+Add-Cl 'Windows' 'Windows error reports' 'Crash and error reports waiting to be sent or archived' @("$PD\Microsoft\Windows\WER\ReportArchive\*", "$PD\Microsoft\Windows\WER\ReportQueue\*", "$PD\Microsoft\Windows\WER\Temp\*", "$LA\Microsoft\Windows\WER\ReportArchive\*", "$LA\Microsoft\Windows\WER\ReportQueue\*")
+Add-Cl 'Windows' 'Memory dump files' 'Minidumps, MEMORY.DMP and kernel reports from past crashes' @("$WIN\Minidump\*", "$WIN\MEMORY.DMP", "$WIN\LiveKernelReports\*.dmp")
+Add-Cl 'Windows' 'Windows log files' 'CBS, DISM and Windows Update log files' @("$WIN\Logs\CBS\*.log", "$WIN\Logs\DISM\*.log", "$WIN\Logs\WindowsUpdate\*")
+Add-Cl 'Windows' 'App crash dumps' 'Crash dumps written by apps in your profile' @("$LA\CrashDumps\*")
+Add-Cl 'Windows' 'DNS cache' 'Flushes the cached name lookups (ipconfig /flushdns)' @() -Kind 'Dns'
+
+# ---- Browsers (cache only: your passwords, history, cookies and bookmarks are never touched)
+Add-Cl 'Browsers' 'Google Chrome cache' 'Cached web files, code cache and GPU cache' @("$LA\Google\Chrome\User Data\*\Cache\*", "$LA\Google\Chrome\User Data\*\Code Cache\*", "$LA\Google\Chrome\User Data\*\GPUCache\*", "$LA\Google\Chrome\User Data\ShaderCache\*")
+Add-Cl 'Browsers' 'Microsoft Edge cache' 'Cached web files, code cache and GPU cache' @("$LA\Microsoft\Edge\User Data\*\Cache\*", "$LA\Microsoft\Edge\User Data\*\Code Cache\*", "$LA\Microsoft\Edge\User Data\*\GPUCache\*", "$LA\Microsoft\Edge\User Data\ShaderCache\*")
+Add-Cl 'Browsers' 'Mozilla Firefox cache' 'Cached web files and startup cache for every profile' @("$LA\Mozilla\Firefox\Profiles\*\cache2\*", "$LA\Mozilla\Firefox\Profiles\*\startupCache\*")
+Add-Cl 'Browsers' 'Brave cache' 'Cached web files, code cache and GPU cache' @("$LA\BraveSoftware\Brave-Browser\User Data\*\Cache\*", "$LA\BraveSoftware\Brave-Browser\User Data\*\Code Cache\*", "$LA\BraveSoftware\Brave-Browser\User Data\*\GPUCache\*")
+Add-Cl 'Browsers' 'Opera cache' 'Cached web files, code cache and GPU cache' @("$LA\Opera Software\Opera Stable\Cache\*", "$LA\Opera Software\Opera Stable\Code Cache\*", "$LA\Opera Software\Opera Stable\GPUCache\*", "$RA\Opera Software\Opera Stable\Cache\*")
+Add-Cl 'Browsers' 'Vivaldi cache' 'Cached web files, code cache and GPU cache' @("$LA\Vivaldi\User Data\*\Cache\*", "$LA\Vivaldi\User Data\*\Code Cache\*", "$LA\Vivaldi\User Data\*\GPUCache\*")
+
+# ---- Applications
+Add-Cl 'Applications' 'Discord cache' 'Cached images and code' @("$RA\discord\Cache\*", "$RA\discord\Code Cache\*", "$RA\discord\GPUCache\*")
+Add-Cl 'Applications' 'Spotify cache' 'Cached songs and covers (Storage folder)' @("$LA\Spotify\Storage\*")
+Add-Cl 'Applications' 'Slack cache' 'Cached images and code' @("$RA\Slack\Cache\*", "$RA\Slack\Code Cache\*", "$RA\Slack\GPUCache\*")
+Add-Cl 'Applications' 'Microsoft Teams (classic) cache' 'Cached images, logs and temporary data' @("$RA\Microsoft\Teams\Cache\*", "$RA\Microsoft\Teams\blob_storage\*", "$RA\Microsoft\Teams\GPUCache\*", "$RA\Microsoft\Teams\tmp\*")
+Add-Cl 'Applications' 'Visual Studio Code cache' 'Cached data, code cache and GPU cache' @("$RA\Code\Cache\*", "$RA\Code\CachedData\*", "$RA\Code\GPUCache\*")
+Add-Cl 'Applications' 'Steam web cache' 'Steam browser cache (not your games)' @("$LA\Steam\htmlcache\*")
+Add-Cl 'Applications' 'GPU shader caches' 'NVIDIA, AMD and DirectX shader caches. Games rebuild them, so first launch can stutter' @("$LA\NVIDIA\DXCache\*", "$LA\NVIDIA\GLCache\*", "$LA\AMD\DxCache\*", "$LA\D3DSCache\*") -On $false
+Add-Cl 'Applications' 'Developer caches' 'npm, pip and NuGet download caches. Packages download again when needed' @("$RA\npm-cache\*", "$LA\pip\Cache\*", "$LA\NuGet\v3-cache\*") -On $false
+
+# ---- Privacy traces
+Add-Cl 'Privacy traces' 'Recent files and jump lists' 'Recent items and taskbar jump lists' @("$RA\Microsoft\Windows\Recent\*.lnk", "$RA\Microsoft\Windows\Recent\AutomaticDestinations\*", "$RA\Microsoft\Windows\Recent\CustomDestinations\*") -On $false
+Add-Cl 'Privacy traces' 'Run dialog history' 'The list of commands typed in Win+R' @("$ExplorerKey\RunMRU") -On $false -Kind 'RegClear'
+Add-Cl 'Privacy traces' 'Explorer address bar history' 'Paths typed into File Explorer' @("$ExplorerKey\TypedPaths") -On $false -Kind 'RegClear'
+Add-Cl 'Privacy traces' 'Explorer search history' 'Searches typed into File Explorer' @("$ExplorerKey\WordWheelQuery") -On $false -Kind 'RegClear'
+
+# ---- Advanced
+Add-Cl 'Advanced' 'Prefetch files' 'Windows launch-speed hints. Rebuilt, but apps start a little slower at first' @("$WIN\Prefetch\*.pf") -On $false
+Add-Cl 'Advanced' 'Windows event logs' 'Clears every event log except Security. Loses troubleshooting history' @() -On $false -Kind 'EventLogs'
+Add-Cl 'Advanced' 'Component store cleanup (WinSxS)' 'Removes superseded Windows components via DISM. Takes several minutes' @() -On $false -Kind 'Dism'
+
+function Test-SafeClean([string]$p) {
+    if ($p -notmatch '^[A-Za-z]:\\[^\\]+\\.+') { return $false }
+    if ($p -match '^[A-Za-z]:\\Windows\\(System32|SysWOW64|WinSxS)(\\|$)') { return $false }
+    return $true
+}
+
+function Get-DirBytes([string]$Path) {
+    try {
+        $m = Get-ChildItem -LiteralPath $Path -Recurse -File -Force -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum
+        if ($m.Sum) { return [double]$m.Sum }
+    } catch { }
+    return 0.0
+}
+
+function Get-RecycleBytes {
+    try {
+        $sh = New-Object -ComObject Shell.Application
+        $sum = 0.0
+        foreach ($i in $sh.Namespace(10).Items()) { $sum += [double]$i.Size }
+        return $sum
+    } catch { return 0.0 }
+}
+
+# Returns the size in bytes, or $null for items that have no meaningful size (DNS, event logs...)
+function Get-CleanSize($it) {
+    switch ($it.Kind) {
+        'Recycle' { return (Get-RecycleBytes) }
+        'Files' {
+            $total = 0.0
+            foreach ($p in $it.Paths) {
+                if (-not (Test-SafeClean $p)) { continue }
+                foreach ($f in (Get-ChildItem -Path $p -Force -ErrorAction SilentlyContinue)) {
+                    if (($f.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
+                    if ($f.PSIsContainer) { $total += (Get-DirBytes $f.FullName) } else { $total += [double]$f.Length }
+                }
+            }
+            return $total
+        }
+        default { return $null }
+    }
+}
+
+function Invoke-CleanItem($it) {
+    switch ($it.Kind) {
+        'Recycle' { try { Clear-RecycleBin -Force -ErrorAction Stop } catch { } }
+        'Dns'     { try { & ipconfig.exe /flushdns | Out-Null } catch { } }
+        'EventLogs' {
+            foreach ($l in @(& wevtutil.exe el)) {
+                if ($l -and $l -ne 'Security') { try { & wevtutil.exe cl $l 2>&1 | Out-Null } catch { } }
+                [Windows.Forms.Application]::DoEvents()
+            }
+        }
+        'Dism' {
+            $p = Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\dism.exe') -ArgumentList '/Online /Cleanup-Image /StartComponentCleanup /NoRestart' -WindowStyle Hidden -PassThru
+            Wait-ProcUi $p
+        }
+        'RegClear' {
+            foreach ($rp in $it.Paths) {
+                $k = Open-Reg $rp $true
+                if ($k) {
+                    foreach ($n in $k.GetValueNames()) { try { $k.DeleteValue($n, $false) } catch { } }
+                    $k.Close()
+                }
+            }
+        }
+        default {
+            $stopped = @()
+            foreach ($s in $it.Svc) {
+                $sv = Get-Service -Name $s -ErrorAction SilentlyContinue
+                if ($sv -and $sv.Status -eq 'Running') { Stop-Service -Name $s -Force -ErrorAction SilentlyContinue; $stopped += $s }
+            }
+            try {
+                foreach ($p in $it.Paths) {
+                    if (-not (Test-SafeClean $p)) { continue }
+                    foreach ($f in (Get-ChildItem -Path $p -Force -ErrorAction SilentlyContinue)) {
+                        if (($f.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
+                        Remove-Item -LiteralPath $f.FullName -Recurse -Force -ErrorAction SilentlyContinue
+                    }
+                    [Windows.Forms.Application]::DoEvents()
+                }
+            } finally {
+                foreach ($s in $stopped) { Start-Service -Name $s -ErrorAction SilentlyContinue }
+            }
+        }
+    }
+}
+
+# ====================================================================== REGISTRY CLEANER
+function Add-RegIssue($List, [string]$Cat, [string]$Item, [string]$Path, [string]$Kind, [string]$Name) {
+    [void]$List.Add(@{ Cat = $Cat; Item = $Item; Path = $Path; Kind = $Kind; Name = $Name })
+}
+
+function Find-RegistryIssues {
+    $script:FixedRoots = $null
+    $out = New-Object System.Collections.ArrayList
+
+    # 1. missing shared DLLs
+    foreach ($base in @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\SharedDLLs', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\SharedDLLs')) {
+        $k = Open-Reg $base
+        if (-not $k) { continue }
+        foreach ($n in $k.GetValueNames()) {
+            if ($n -and (Test-Missing $n)) { Add-RegIssue $out 'Missing shared DLL' $n $base 'Value' $n }
+        }
+        $k.Close()
+        [Windows.Forms.Application]::DoEvents()
+    }
+
+    # 2. obsolete application paths
+    foreach ($base in @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths', 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths')) {
+        $k = Open-Reg $base
+        if (-not $k) { continue }
+        foreach ($sn in $k.GetSubKeyNames()) {
+            $sk = $k.OpenSubKey($sn)
+            if (-not $sk) { continue }
+            $def = [string]$sk.GetValue('')
+            $sk.Close()
+            $f = Get-CmdFile $def
+            if ($f -and (Test-Missing $f)) { Add-RegIssue $out 'Obsolete application path' $sn ($base + '\' + $sn) 'Key' $null }
+        }
+        $k.Close()
+        [Windows.Forms.Application]::DoEvents()
+    }
+
+    # 3. broken uninstall entries (uninstaller and install folder are both gone)
+    foreach ($base in $UninstallRoots) {
+        $k = Open-Reg $base
+        if (-not $k) { continue }
+        foreach ($sn in $k.GetSubKeyNames()) {
+            $sk = $k.OpenSubKey($sn)
+            if (-not $sk) { continue }
+            $dn = [string]$sk.GetValue('DisplayName')
+            $us = [string]$sk.GetValue('UninstallString')
+            $il = [string]$sk.GetValue('InstallLocation')
+            $sc = $sk.GetValue('SystemComponent')
+            $wi = $sk.GetValue('WindowsInstaller')
+            $parent = [string]$sk.GetValue('ParentKeyName')
+            $sk.Close()
+            if (-not $dn -or -not $us -or $parent -or $sc -eq 1 -or $wi -eq 1) { continue }
+            $f = Get-CmdFile $us
+            if (-not $f -or -not (Test-Missing $f)) { continue }
+            if ($il -and -not (Test-Missing $il)) { continue }
+            Add-RegIssue $out 'Broken uninstall entry' $dn ($base + '\' + $sn) 'Key' $null
+        }
+        $k.Close()
+        [Windows.Forms.Application]::DoEvents()
+    }
+
+    # 4. startup entries that point to missing programs
+    foreach ($base in $RunKeys) {
+        $k = Open-Reg $base
+        if (-not $k) { continue }
+        foreach ($n in $k.GetValueNames()) {
+            if (-not $n) { continue }
+            $f = Get-CmdFile ([string]$k.GetValue($n))
+            if ($f -and (Test-Missing $f)) { Add-RegIssue $out 'Startup entry with missing program' $n $base 'Value' $n }
+        }
+        $k.Close()
+    }
+
+    # 5. stale MUI cache entries
+    $mui = 'HKCU:\Software\Classes\Local Settings\Software\Microsoft\Windows\Shell\MuiCache'
+    $k = Open-Reg $mui
+    if ($k) {
+        foreach ($n in $k.GetValueNames()) {
+            if ($n -match '^(.*)\.(FriendlyAppName|ApplicationCompany)$') {
+                $f = $Matches[1]
+                if (Test-Missing $f) { Add-RegIssue $out 'Stale MUI cache entry' $f $mui 'Value' $n }
+            }
+        }
+        $k.Close()
+    }
+
+    # 6. compatibility settings for programs that no longer exist
+    foreach ($base in @('HKCU:\Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers', 'HKLM:\Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers',
+                        'HKCU:\Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Compatibility Assistant\Persisted', 'HKCU:\Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Compatibility Assistant\Store')) {
+        $k = Open-Reg $base
+        if (-not $k) { continue }
+        foreach ($n in $k.GetValueNames()) {
+            if ($n -and (Test-Missing $n)) { Add-RegIssue $out 'Obsolete compatibility entry' $n $base 'Value' $n }
+        }
+        $k.Close()
+    }
+
+    # 7. installer folder records for folders that are gone
+    $inst = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\Folders'
+    $k = Open-Reg $inst
+    if ($k) {
+        foreach ($n in $k.GetValueNames()) {
+            if ($n -and (Test-Missing $n)) { Add-RegIssue $out 'Missing installer folder' $n $inst 'Value' $n }
+        }
+        $k.Close()
+    }
+
+    return ($out | Sort-Object { $_.Cat }, { $_.Item })
+}
+
+# Saves a .reg backup of each affected key first, then deletes. Nothing is deleted without a backup.
+function Remove-RegIssues($Issues, [string]$BakDir) {
+    New-Item -ItemType Directory -Path $BakDir -Force | Out-Null
+    $saved = @{}
+    $done = New-Object System.Collections.ArrayList
+    $fail = 0; $n = 0
+    foreach ($i in $Issues) {
+        $n++
+        $keyPath = [string]$i.Path
+        if (-not $saved.ContainsKey($keyPath)) {
+            $native = $keyPath -replace '^(HK[A-Z]{2}):\\?', '$1\'
+            $file = Join-Path $BakDir ('{0:D4}.reg' -f $saved.Count)
+            $okExport = $false
+            try {
+                $p = Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\reg.exe') -ArgumentList ('export "{0}" "{1}" /y' -f $native, $file) -WindowStyle Hidden -PassThru
+                Wait-ProcUi $p
+                $okExport = ($p.ExitCode -eq 0 -and (Test-Path -LiteralPath $file))
+            } catch { }
+            $saved[$keyPath] = $okExport
+            if ($okExport) { Add-Content -LiteralPath (Join-Path $BakDir 'index.txt') -Value ('{0}  {1}' -f (Split-Path $file -Leaf), $native) }
+        }
+        if (-not $saved[$keyPath]) { $fail++; Write-Log ("Backup failed, left untouched: " + $i.Item) 'ERROR'; continue }
+        try {
+            if ($i.Kind -eq 'Key') {
+                $s = Split-RegPath $i.Path
+                $s.Root.DeleteSubKeyTree($s.Sub, $false)
+            } else {
+                $k = Open-Reg $i.Path $true
+                if ($k) { $k.DeleteValue($i.Name, $false); $k.Close() }
+            }
+            [void]$done.Add($i)
+        } catch { $fail++; Write-Log ("Could not remove {0}: {1}" -f $i.Item, $_.Exception.Message) 'ERROR' }
+        if (($n % 10) -eq 0) { [Windows.Forms.Application]::DoEvents() }
+    }
+    return @{ Done = $done; Fail = $fail }
+}
+
+# ====================================================================== LEFTOVERS
+$ProtectedFolders = @('Common Files', 'Microsoft*', 'Windows*', 'WindowsApps', 'ModifiableWindowsApps', 'WindowsPowerShell', 'Internet Explorer',
+    'Reference Assemblies', 'MSBuild', 'dotnet', 'Uninstall Information', 'Application Verifier', 'IIS', 'IIS Express', 'Packages', 'Package Cache',
+    'Temp', 'Programs', 'Publishers', 'ConnectedDevices', 'VirtualStore', 'Comms', 'PlaceholderTileLogoFolder', 'USOShared', 'USOPrivate', 'regid.*',
+    'SoftwareDistribution', 'ssh', 'Intel', 'NVIDIA*', 'AMD', 'Realtek*', 'Dolby*', 'Synaptics*', 'Qualcomm*', 'Waves*', 'WinCrow', 'Application Data',
+    'Desktop', 'Documents', 'Start Menu', 'Templates', 'Low', 'History', 'INetCache', 'CrashDumps', 'D3DSCache', 'Adobe', 'Google', 'Mozilla', 'Apple*',
+    'Oracle', 'Java', 'Git', 'Docker', 'Python*', 'nodejs', 'PowerShell')
+
+function Test-Protected([string]$Name) {
+    foreach ($p in $ProtectedFolders) { if ($Name -like $p) { return $true } }
+    return $false
+}
+
+function Test-NameKnown([string]$Folder, $Names) {
+    $n = Get-NormName $Folder
+    if ($n.Length -lt 3) { return $true }
+    foreach ($x in $Names) {
+        if (-not $x) { continue }
+        if ($x.Contains($n)) { return $true }
+        if ($x.Length -ge 4 -and $n.Contains($x)) { return $true }
+    }
+    return $false
+}
+
+# Everything that proves a folder is still in use: installed programs, services, running processes, startup items, tasks
+function Get-InUseEvidence {
+    $names = New-Object System.Collections.ArrayList
+    $paths = New-Object System.Collections.ArrayList
+    foreach ($base in $UninstallRoots) {
+        $k = Open-Reg $base
+        if (-not $k) { continue }
+        foreach ($sn in $k.GetSubKeyNames()) {
+            $sk = $k.OpenSubKey($sn)
+            if (-not $sk) { continue }
+            foreach ($v in @('DisplayName', 'Publisher')) { $x = [string]$sk.GetValue($v); if ($x) { [void]$names.Add((Get-NormName $x)) } }
+            foreach ($v in @('InstallLocation', 'UninstallString', 'DisplayIcon')) { $x = [string]$sk.GetValue($v); if ($x) { [void]$paths.Add($x.ToLower()) } }
+            $sk.Close()
+        }
+        $k.Close()
+        [Windows.Forms.Application]::DoEvents()
+    }
+    try { foreach ($s in (Get-CimInstance -ClassName Win32_Service -ErrorAction Stop)) { if ($s.PathName) { [void]$paths.Add(([string]$s.PathName).ToLower()) } } } catch { }
+    try { foreach ($p in (Get-CimInstance -ClassName Win32_Process -ErrorAction Stop)) { if ($p.ExecutablePath) { [void]$paths.Add(([string]$p.ExecutablePath).ToLower()) } } } catch { }
+    foreach ($rk in $RunKeys) {
+        $k = Open-Reg $rk
+        if ($k) { foreach ($n in $k.GetValueNames()) { $x = [string]$k.GetValue($n); if ($x) { [void]$paths.Add($x.ToLower()) } }; $k.Close() }
+    }
+    try {
+        foreach ($t in (Get-ScheduledTask -ErrorAction Stop)) {
+            foreach ($a in $t.Actions) { if ($a.Execute) { [void]$paths.Add(([string]$a.Execute).ToLower()) } }
+        }
+    } catch { }
+    [Windows.Forms.Application]::DoEvents()
+    return @{ Names = @($names); Paths = @($paths) }
+}
+
+function Find-Leftovers {
+    $script:FixedRoots = $null
+    $out = New-Object System.Collections.ArrayList
+    $cut = (Get-Date).AddDays(-30)
+    $ev = Get-InUseEvidence
+    $evPaths = New-Object System.Collections.ArrayList
+    [void]$evPaths.AddRange(@($ev.Paths))
+
+    # shortcuts: broken ones are leftovers, working ones prove a folder is in use
+    $ws = New-Object -ComObject WScript.Shell
+    $scDirs = @("$env:ProgramData\Microsoft\Windows\Start Menu\Programs", "$env:APPDATA\Microsoft\Windows\Start Menu\Programs",
+                [Environment]::GetFolderPath('Desktop'), [Environment]::GetFolderPath('CommonDesktopDirectory')) |
+              Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -Unique
+    foreach ($d in $scDirs) {
+        foreach ($l in (Get-ChildItem -LiteralPath $d -Filter '*.lnk' -Recurse -File -Force -ErrorAction SilentlyContinue)) {
+            $t = $null
+            try { $t = [string]$ws.CreateShortcut($l.FullName).TargetPath } catch { continue }
+            if (-not $t) { continue }
+            if (Test-Missing $t) {
+                [void]$out.Add(@{ Kind = 'Shortcut'; Cat = 'Broken shortcut'; Path = $l.FullName; Why = ('Points to a file that is gone: ' + $t); Size = 0.0 })
+            } else { [void]$evPaths.Add($t.ToLower()) }
+        }
+        [Windows.Forms.Application]::DoEvents()
+    }
+
+    # folders: empty ones everywhere, orphaned program folders in Program Files
+    $pf = @($env:ProgramFiles, ${env:ProgramFiles(x86)}) | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -Unique
+    $roots = @($pf) + @($env:ProgramData, $env:LOCALAPPDATA, $env:APPDATA) | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -Unique
+    foreach ($r in $roots) {
+        $isPf = ($pf -contains $r)
+        foreach ($d in (Get-ChildItem -LiteralPath $r -Directory -Force -ErrorAction SilentlyContinue)) {
+            if (($d.Attributes -band ([IO.FileAttributes]::ReparsePoint -bor [IO.FileAttributes]::System)) -ne 0) { continue }
+            if (Test-Protected $d.Name) { continue }
+            if ($d.LastWriteTime -gt $cut) { continue }
+            $first = Get-ChildItem -LiteralPath $d.FullName -Recurse -File -Force -ErrorAction SilentlyContinue | Select-Object -First 1
+            if (-not $first) {
+                [void]$out.Add(@{ Kind = 'EmptyDir'; Cat = 'Empty folder'; Path = $d.FullName; Why = ('Contains no files. Last changed ' + $d.LastWriteTime.ToString('yyyy-MM-dd')); Size = 0.0 })
+                continue
+            }
+            if (-not $isPf) { continue }
+            if (Test-NameKnown $d.Name $ev.Names) { continue }
+            $low = $d.FullName.ToLower()
+            $used = $false
+            foreach ($p in $evPaths) { if ($p.Contains($low)) { $used = $true; break } }
+            if ($used) { continue }
+            $sz = Get-DirBytes $d.FullName
+            [void]$out.Add(@{ Kind = 'Orphan'; Cat = 'Program folder with no matching program'; Path = $d.FullName
+                              Why = ('{0}. No installed program, service, startup item or shortcut uses it. Last changed {1}' -f (Format-Size $sz), $d.LastWriteTime.ToString('yyyy-MM-dd')); Size = $sz })
+        }
+        [Windows.Forms.Application]::DoEvents()
+    }
+    return ($out | Sort-Object { $_.Kind }, { $_.Path })
+}
+
+function Remove-Leftovers($Items) {
+    $done = New-Object System.Collections.ArrayList
+    $qRoot = $null
+    foreach ($i in $Items) {
+        try {
+            switch ($i.Kind) {
+                'Shortcut' { Remove-Item -LiteralPath $i.Path -Force -ErrorAction Stop }
+                'EmptyDir' { Remove-Item -LiteralPath $i.Path -Recurse -Force -ErrorAction Stop }
+                'Orphan' {
+                    if (-not $qRoot) {
+                        $qRoot = Join-Path $QuarantineDir (Get-Date -Format 'yyyyMMdd-HHmmss')
+                        New-Item -ItemType Directory -Path $qRoot -Force | Out-Null
+                    }
+                    $leaf = Split-Path $i.Path -Leaf
+                    $tag = (Split-Path (Split-Path $i.Path -Parent) -Leaf) -replace '[^A-Za-z0-9]', ''
+                    $dest = Join-Path $qRoot ($tag + '_' + $leaf)
+                    $x = 1
+                    while (Test-Path -LiteralPath $dest) { $dest = (Join-Path $qRoot ($tag + '_' + $leaf)) + '-' + $x; $x++ }
+                    Move-Item -LiteralPath $i.Path -Destination $dest -Force -ErrorAction Stop
+                    Add-Content -LiteralPath (Join-Path $qRoot 'origin.txt') -Value ($dest + '  <-  ' + $i.Path)
+                }
+            }
+            [void]$done.Add($i)
+            Write-Log ('Removed: ' + $i.Path)
+        } catch { Write-Log ('Could not remove {0}: {1}' -f $i.Path, $_.Exception.Message) 'ERROR' }
+        [Windows.Forms.Application]::DoEvents()
+    }
+    return $done
+}
+
+# ====================================================================== UPDATES (version.txt on the main branch)
+# WinCrow reads version.txt from the main branch of the GitHub project. Same number: nothing happens.
+# Higher number: it offers to replace this script with WinCrow.ps1 from the main branch.
+$RawBase    = "https://raw.githubusercontent.com/$RepoOwner/$RepoName/main"
+$VersionUrl = "$RawBase/version.txt"
+$ScriptUrl  = "$RawBase/WinCrow.ps1"
+$UserAgent  = "WinCrow/$AppVersion"
+$script:PendingUpdate = $null
+
+# Runs in a background job at startup and inline when you press "Check for updates"
+$UpdateFetch = {
+    param($uri, $ua)
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+        $r = Invoke-WebRequest -Uri $uri -UseBasicParsing -Headers @{ 'User-Agent' = $ua; 'Cache-Control' = 'no-cache' } -TimeoutSec 8 -ErrorAction Stop
+        [pscustomobject]@{ Ok = $true; Text = [string]$r.Content; Code = 200; Msg = '' }
+    } catch {
+        $c = 0
+        try { $c = [int]$_.Exception.Response.StatusCode } catch { }
+        [pscustomobject]@{ Ok = $false; Text = ''; Code = $c; Msg = $_.Exception.Message }
+    }
+}
+
+function Read-Version($res) {
+    if (-not $res) { return @{ State = 'Error'; Msg = 'No answer from GitHub.' } }
+    if (-not $res.Ok) {
+        if ($res.Code -eq 404) { return @{ State = 'NoVersion' } }
+        return @{ State = 'Error'; Msg = [string]$res.Msg }
+    }
+    $first = (([string]$res.Text).Trim([char[]]@([char]0xFEFF, ' ', "`r", "`n", "`t")) -split "`n")[0].Trim()
+    if ($first -match '^[vV]?([0-9]+(\.[0-9]+){1,3})$') {
+        $ver = [version]$Matches[1]
+        $state = 'Current'
+        if ($ver -gt [version]$AppVersion) { $state = 'Newer' }
+        return @{ State = $state; Tag = ('v' + $ver.ToString()); Version = $ver.ToString(); Page = $RepoUrl; Notes = ''; Download = $ScriptUrl }
+    }
+    return @{ State = 'Error'; Msg = 'version.txt on GitHub does not contain a version number such as 1.2.0.' }
+}
+
+# Downloads WinCrow.ps1 from the main branch, checks it, swaps the script file and restarts WinCrow
+function Install-Update($rel) {
+    $dest = $PSCommandPath
+    if (-not $dest) { throw 'The path of this script is unknown, so it cannot be updated.' }
+    try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }
+    $hdr = @{ 'User-Agent' = $UserAgent; 'Cache-Control' = 'no-cache' }
+    $tmp = Join-Path $env:TEMP ('WinCrow-update-{0}.ps1' -f [guid]::NewGuid().ToString('N'))
+    Write-Log ('Downloading WinCrow ' + $rel.Version + '...')
+    try {
+        Invoke-WebRequest -Uri $rel.Download -OutFile $tmp -UseBasicParsing -Headers $hdr -TimeoutSec 60 -ErrorAction Stop
+        $tok = $null; $errs = $null
+        [void][Management.Automation.Language.Parser]::ParseFile($tmp, [ref]$tok, [ref]$errs)
+        if ($errs -and $errs.Count -gt 0) { throw 'The downloaded file is not a valid PowerShell script, so nothing was changed.' }
+        $body = Get-Content -LiteralPath $tmp -Raw
+        if ($body -notmatch '\$AppName\s*=\s*''WinCrow''') { throw 'The downloaded file does not look like WinCrow, so nothing was changed.' }
+        if ($body -match '\$AppVersion\s*=\s*''([0-9.]+)''') {
+            if ([version]$Matches[1] -le [version]$AppVersion) {
+                throw ('version.txt says ' + $rel.Version + ' but WinCrow.ps1 on GitHub is still version ' + $Matches[1] + '. Nothing was changed.')
+            }
+        } else { throw 'The downloaded file has no version number, so nothing was changed.' }
+        Copy-Item -LiteralPath $dest -Destination ($dest + '.bak') -Force -ErrorAction SilentlyContinue
+        Copy-Item -LiteralPath $tmp -Destination $dest -Force
+    } finally {
+        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+    }
+    Write-Log ('Updated to ' + $rel.Version + '. Restarting WinCrow...')
+    Start-Process -FilePath $PsExe -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', "`"$dest`"")
+    $form.Close()
+}
+
 # ====================================================================== UI BUILDING BLOCKS
 function Set-Role($ctl, [string]$Role) { $script:Roles[$ctl] = $Role; return $ctl }
 
@@ -696,13 +1289,14 @@ function Show-Page([string]$Key) {
 }
 
 $i = 0
-foreach ($n in @(@{ K = 'Debloat'; T = '   Debloat' }, @{ K = 'Startup'; T = '   Startup apps' }, @{ K = 'Tweaks'; T = '   Tweaks' }, @{ K = 'About'; T = '   About' })) {
+foreach ($n in @(@{ K = 'Debloat'; T = '   Debloat' }, @{ K = 'Cleaner'; T = '   Cleaner' }, @{ K = 'Registry'; T = '   Registry' }, @{ K = 'Leftovers'; T = '   Leftovers' },
+                 @{ K = 'Startup'; T = '   Startup apps' }, @{ K = 'Tweaks'; T = '   Tweaks' }, @{ K = 'About'; T = '   About' })) {
     $b = New-Object Windows.Forms.Button
     $b.Text = $n.T; $b.Tag = $n.K; $b.TextAlign = 'MiddleLeft'; $b.FlatStyle = 'Flat'; $b.Cursor = 'Hand'
     $b.FlatAppearance.BorderSize = 0
     $b.Font = New-Object Drawing.Font('Segoe UI Semibold', 11)
-    $b.Size = New-Object Drawing.Size(190, 48)
-    $b.Location = New-Object Drawing.Point(0, (16 + $i * 50))
+    $b.Size = New-Object Drawing.Size(190, 44)
+    $b.Location = New-Object Drawing.Point(0, (12 + $i * 46))
     $b.Add_Click({ param($s, $e) Show-Page $s.Tag })
     [void](Set-Role $b 'nav')
     $nav.Controls.Add($b)
@@ -712,9 +1306,17 @@ foreach ($n in @(@{ K = 'Debloat'; T = '   Debloat' }, @{ K = 'Startup'; T = '  
 
 $btnTheme = New-Btn 'Light theme' 'ghost' 160
 $btnTheme.Margin = New-Object Windows.Forms.Padding(0)
-$btnTheme.Location = New-Object Drawing.Point(15, 300)
+$btnTheme.Location = New-Object Drawing.Point(15, 420)
 $nav.Controls.Add($btnTheme)
-$nav.Add_Resize({ $btnTheme.Location = New-Object Drawing.Point(15, ($nav.ClientSize.Height - 56)) })
+$btnUpdate = New-Btn 'Update available' 'primary' 160
+$btnUpdate.Margin = New-Object Windows.Forms.Padding(0)
+$btnUpdate.Location = New-Object Drawing.Point(15, 376)
+$btnUpdate.Visible = $false
+$nav.Controls.Add($btnUpdate)
+$nav.Add_Resize({
+    $btnTheme.Location  = New-Object Drawing.Point(15, ($nav.ClientSize.Height - 52))
+    $btnUpdate.Location = New-Object Drawing.Point(15, ($nav.ClientSize.Height - 96))
+})
 
 # --- main area
 $main = New-Object Windows.Forms.Panel
@@ -724,8 +1326,11 @@ $main.Dock = 'Fill'; $main.BackColor = $C.Bg
 $Pg.Debloat = New-Page 'Debloat' 'Tick the apps you want gone. Recommended ones are pre-ticked. Removal is for all users and also stops them returning on new accounts.' @(45, 55)
 $Pg.Startup = New-Page 'Startup apps' 'Ticked = starts with Windows. Untick the ones you want to stop, then press Apply. Nothing is deleted - you can turn them back on here.' @(30, 18, 52)
 $Pg.Tweaks  = New-Page 'Tweaks' 'Ticked = tweak is active. Tick to apply, untick to restore the Windows default.' @(38, 62)
+$Pg.Cleaner   = New-Page 'Cleaner' 'Tick what to clean. Analyze shows the size of each item. Close browsers first. Cleaned files skip the Recycle Bin.' @(30, 54, 16)
+$Pg.Registry  = New-Page 'Registry' 'Finds broken and obsolete entries. A .reg backup is saved before any change, so every fix can be undone.' @(30, 48, 22)
+$Pg.Leftovers = New-Page 'Leftovers' 'Empty folders, broken shortcuts and program folders that look uninstalled. Program folders go to quarantine.' @(46, 16, 38)
 $Pg.About   = New-Page 'About' '' $null
-foreach ($k in 'Debloat', 'Startup', 'Tweaks', 'About') { $main.Controls.Add($Pg[$k].Page) }
+foreach ($k in 'Debloat', 'Cleaner', 'Registry', 'Leftovers', 'Startup', 'Tweaks', 'About') { $main.Controls.Add($Pg[$k].Page) }
 
 $script:Progress = New-Object Windows.Forms.ProgressBar
 $script:Progress.Dock = 'Bottom'; $script:Progress.Height = 6; $script:Progress.Style = 'Continuous'
@@ -947,16 +1552,323 @@ $lnk.Add_Click({ try { Start-Process "mailto:$DevEmail" } catch { } })
 [void](Set-Role $lnk 'link')
 $about.Controls.Add($lnk)
 [void](New-AboutLabel ("Detected:    $OsCaption (build $Build)`r`nInstalled:   $InstallDir`r`nLogs:           $LogDir") 'Consolas' 9.5 'sub' 23 268 760 70)
+$lblUpdate = New-AboutLabel "Version $AppVersion. Press Check for updates to look for a newer version." 'Segoe UI' 10 'sub' 23 346
+$chkAuto = New-Object Windows.Forms.CheckBox
+$chkAuto.Text = 'Check for updates when WinCrow starts'
+$chkAuto.AutoSize = $true
+$chkAuto.Checked = [bool]$script:Settings.AutoUpdate
+$chkAuto.Location = New-Object Drawing.Point(23, 378)
+$chkAuto.ForeColor = $C.Text
+[void](Set-Role $chkAuto 'bg')
+$chkAuto.Add_CheckedChanged({ $script:Settings.AutoUpdate = $chkAuto.Checked; Save-Settings })
+$about.Controls.Add($chkAuto)
 $Pg.About.Page.Controls.Add($about)
 $about.BringToFront()
 
-$btnOpenLogs  = New-Btn 'Open logs folder' 'ghost' 150
-$btnUninstall = New-Btn 'Uninstall WinCrow' 'danger' 160
-$Pg.About.Bar.Controls.AddRange(@($btnOpenLogs, $btnUninstall))
+$btnCheckUpd  = New-Btn 'Check for updates' 'primary' 160
+$btnRepo      = New-Btn 'GitHub page' 'ghost' 110
+$btnOpenLogs  = New-Btn 'Open logs folder' 'ghost' 140
+$btnUninstall = New-Btn 'Uninstall WinCrow' 'danger' 150
+$Pg.About.Bar.Controls.AddRange(@($btnCheckUpd, $btnRepo, $btnOpenLogs, $btnUninstall))
 $btnOpenLogs.Add_Click({ Start-Process explorer.exe -ArgumentList "`"$LogDir`"" })
 $btnUninstall.Add_Click({
-    $ans = [Windows.Forms.MessageBox]::Show("Remove WinCrow, its Start menu shortcut and its folder?`n`n(Your Windows settings stay as they are.)", 'WinCrow', 'YesNo', 'Question')
+    $ans = [Windows.Forms.MessageBox]::Show("Remove WinCrow, its Start menu shortcut and its folder?`n`n(Your Windows settings stay as they are, and your registry backups and quarantine folder in $DataDir are kept.)", 'WinCrow', 'YesNo', 'Question')
     if ($ans -eq 'Yes') { Invoke-Uninstall; $form.Close() }
+})
+
+# ====================================================================== CLEANER PAGE
+$btnClRun     = New-Btn 'Clean selected' 'primary' 150
+$btnClAnalyze = New-Btn 'Analyze' 'ghost' 100
+$btnClAll     = New-Btn 'Select all' 'ghost' 100
+$btnClNone    = New-Btn 'Select none' 'ghost' 110
+$btnClDef     = New-Btn 'Defaults' 'ghost' 90
+$Pg.Cleaner.Bar.Controls.AddRange(@($btnClRun, $btnClAnalyze, $btnClAll, $btnClNone, $btnClDef))
+
+function Load-Cleaner {
+    $lv = $Pg.Cleaner.List
+    $lv.BeginUpdate(); $lv.Items.Clear(); $lv.Groups.Clear(); $lv.ShowGroups = $true
+    $groups = @{}
+    foreach ($c in $CleanCats) {
+        $groups[$c] = New-Object Windows.Forms.ListViewGroup($c, $c)
+        [void]$lv.Groups.Add($groups[$c])
+    }
+    foreach ($it in $Cleaners) {
+        $li = New-Object Windows.Forms.ListViewItem($it.Name)
+        [void]$li.SubItems.Add($it.Desc)
+        [void]$li.SubItems.Add('?')
+        $li.Tag = $it
+        $li.Group = $groups[$it.Cat]
+        $li.Checked = $it.On
+        [void]$lv.Items.Add($li)
+    }
+    $lv.EndUpdate(); Fit-Columns $lv
+}
+
+$btnClAll.Add_Click({ foreach ($li in $Pg.Cleaner.List.Items) { $li.Checked = $true } })
+$btnClNone.Add_Click({ foreach ($li in $Pg.Cleaner.List.Items) { $li.Checked = $false } })
+$btnClDef.Add_Click({ foreach ($li in $Pg.Cleaner.List.Items) { $li.Checked = [bool]$li.Tag.On } })
+
+$btnClAnalyze.Add_Click({
+    Invoke-Busy {
+        $lv = $Pg.Cleaner.List
+        $script:Progress.Maximum = [Math]::Max(1, $lv.Items.Count)
+        $total = 0.0; $n = 0
+        Write-Log 'Measuring what can be cleaned...'
+        foreach ($li in $lv.Items) {
+            $n++
+            $b = Get-CleanSize $li.Tag
+            if ($null -eq $b) { $li.SubItems[2].Text = '-' }
+            else {
+                $li.SubItems[2].Text = Format-Size $b
+                if ($li.Checked) { $total += $b }
+            }
+            $script:Progress.Value = $n
+            [Windows.Forms.Application]::DoEvents()
+        }
+        Write-Log ('Analysis done. {0} can be cleaned from the ticked items.' -f (Format-Size $total))
+    }
+})
+
+$btnClRun.Add_Click({
+    $sel = @($Pg.Cleaner.List.CheckedItems)
+    if ($sel.Count -eq 0) { Show-Msg 'Nothing is selected.'; return }
+    $ans = [Windows.Forms.MessageBox]::Show("Clean $($sel.Count) item(s)?`n`nClose your browsers and other apps first so their files can be cleared. Cleaned files do not go to the Recycle Bin.", 'WinCrow', 'YesNo', 'Warning')
+    if ($ans -ne 'Yes') { return }
+    Invoke-Busy {
+        $script:Progress.Maximum = $sel.Count
+        $freed = 0.0; $n = 0
+        foreach ($li in $sel) {
+            $n++
+            $it = $li.Tag
+            Write-Log ('Cleaning ' + $it.Name + '...')
+            $before = Get-CleanSize $it
+            try { Invoke-CleanItem $it } catch { Write-Log ('Failed: {0} - {1}' -f $it.Name, $_.Exception.Message) 'ERROR' }
+            if ($null -ne $before) {
+                $after = Get-CleanSize $it
+                $d = [Math]::Max(0.0, ([double]$before - [double]$after))
+                $freed += $d
+                $li.SubItems[2].Text = (Format-Size $d) + ' freed'
+            } else { $li.SubItems[2].Text = 'done' }
+            $script:Progress.Value = $n
+            [Windows.Forms.Application]::DoEvents()
+        }
+        Write-Log ('Cleaning finished. About {0} freed. Files that were in use were skipped.' -f (Format-Size $freed))
+    }
+})
+
+# ====================================================================== REGISTRY PAGE
+$btnRgScan  = New-Btn 'Scan for issues' 'primary' 130
+$btnRgFix   = New-Btn 'Fix selected' 'danger' 120
+$btnRgAll   = New-Btn 'Select all' 'ghost' 90
+$btnRgNone  = New-Btn 'Select none' 'ghost' 100
+$btnRgBak   = New-Btn 'Backups folder' 'ghost' 120
+$chkRgRestore = New-Object Windows.Forms.CheckBox
+$chkRgRestore.Text = 'Restore point first'; $chkRgRestore.Checked = $true; $chkRgRestore.AutoSize = $true
+$chkRgRestore.ForeColor = $C.Text; $chkRgRestore.Margin = New-Object Windows.Forms.Padding(8, 8, 0, 0)
+[void](Set-Role $chkRgRestore 'bg')
+$Pg.Registry.Bar.Controls.AddRange(@($btnRgScan, $btnRgFix, $btnRgAll, $btnRgNone, $btnRgBak, $chkRgRestore))
+
+$btnRgAll.Add_Click({ foreach ($li in $Pg.Registry.List.Items) { $li.Checked = $true } })
+$btnRgNone.Add_Click({ foreach ($li in $Pg.Registry.List.Items) { $li.Checked = $false } })
+$btnRgBak.Add_Click({
+    New-Item -ItemType Directory -Path $RegBackupRoot -Force | Out-Null
+    Start-Process explorer.exe -ArgumentList "`"$RegBackupRoot`""
+})
+
+$btnRgScan.Add_Click({
+    Invoke-Busy {
+        Write-Log 'Scanning the registry...'
+        $lv = $Pg.Registry.List
+        $issues = @(Find-RegistryIssues)
+        $lv.BeginUpdate(); $lv.Items.Clear(); $lv.Groups.Clear(); $lv.ShowGroups = $true
+        $counts = @{}
+        foreach ($i in $issues) { if ($counts.ContainsKey($i.Cat)) { $counts[$i.Cat]++ } else { $counts[$i.Cat] = 1 } }
+        $groups = @{}
+        foreach ($c in ($counts.Keys | Sort-Object)) {
+            $groups[$c] = New-Object Windows.Forms.ListViewGroup($c, ('{0} ({1})' -f $c, $counts[$c]))
+            [void]$lv.Groups.Add($groups[$c])
+        }
+        foreach ($i in $issues) {
+            $li = New-Object Windows.Forms.ListViewItem($i.Item)
+            [void]$li.SubItems.Add($i.Path)
+            [void]$li.SubItems.Add($i.Cat)
+            $li.Tag = $i
+            $li.Group = $groups[$i.Cat]
+            $li.Checked = $true
+            [void]$lv.Items.Add($li)
+        }
+        $lv.EndUpdate(); Fit-Columns $lv
+        Write-Log ('Registry scan finished: {0} issue(s) found.' -f $issues.Count)
+    }
+})
+
+$btnRgFix.Add_Click({
+    $sel = @($Pg.Registry.List.CheckedItems | ForEach-Object { $_.Tag })
+    if ($sel.Count -eq 0) { Show-Msg 'Nothing is selected. Press "Scan for issues" first.'; return }
+    $ans = [Windows.Forms.MessageBox]::Show("Fix $($sel.Count) registry issue(s)?`n`nA .reg backup is saved before each change. To undo, open the Backups folder and double-click the .reg file.", 'WinCrow', 'YesNo', 'Question')
+    if ($ans -ne 'Yes') { return }
+    Invoke-Busy {
+        if ($chkRgRestore.Checked) { Write-Log 'Creating restore point...'; New-RestorePoint 'WinCrow - before registry cleaning' }
+        $bak = Join-Path $RegBackupRoot (Get-Date -Format 'yyyyMMdd-HHmmss')
+        $res = Remove-RegIssues $sel $bak
+        $fixed = @($res.Done)
+        foreach ($li in @($Pg.Registry.List.Items)) { if ($fixed -contains $li.Tag) { $li.Remove() } }
+        Write-Log ('Registry cleaned: {0} fixed, {1} failed. Backup saved in {2}' -f $fixed.Count, $res.Fail, $bak)
+    }
+})
+
+# ====================================================================== LEFTOVERS PAGE
+$btnLoScan   = New-Btn 'Scan' 'primary' 100
+$btnLoRun    = New-Btn 'Remove selected' 'danger' 150
+$btnLoAll    = New-Btn 'Select all' 'ghost' 90
+$btnLoNone   = New-Btn 'Select none' 'ghost' 100
+$btnLoOpenQ  = New-Btn 'Quarantine' 'ghost' 100
+$btnLoEmptyQ = New-Btn 'Empty it' 'ghost' 80
+$Pg.Leftovers.Bar.Controls.AddRange(@($btnLoScan, $btnLoRun, $btnLoAll, $btnLoNone, $btnLoOpenQ, $btnLoEmptyQ))
+
+$btnLoAll.Add_Click({ foreach ($li in $Pg.Leftovers.List.Items) { $li.Checked = $true } })
+$btnLoNone.Add_Click({ foreach ($li in $Pg.Leftovers.List.Items) { $li.Checked = $false } })
+$btnLoOpenQ.Add_Click({
+    New-Item -ItemType Directory -Path $QuarantineDir -Force | Out-Null
+    Start-Process explorer.exe -ArgumentList "`"$QuarantineDir`""
+})
+$btnLoEmptyQ.Add_Click({
+    if (-not (Test-Path -LiteralPath $QuarantineDir)) { Show-Msg 'The quarantine folder is already empty.'; return }
+    $sz = Get-DirBytes $QuarantineDir
+    $ans = [Windows.Forms.MessageBox]::Show("Permanently delete everything in quarantine ($(Format-Size $sz))?`n`nThis cannot be undone.", 'WinCrow', 'YesNo', 'Warning')
+    if ($ans -ne 'Yes') { return }
+    Invoke-Busy {
+        Get-ChildItem -LiteralPath $QuarantineDir -Force -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+        Write-Log ('Quarantine emptied. {0} freed.' -f (Format-Size $sz))
+    }
+})
+
+$btnLoScan.Add_Click({
+    Invoke-Busy {
+        Write-Log 'Looking for leftovers (this can take a minute)...'
+        $lv = $Pg.Leftovers.List
+        $found = @(Find-Leftovers)
+        $lv.BeginUpdate(); $lv.Items.Clear(); $lv.Groups.Clear(); $lv.ShowGroups = $true
+        $counts = @{}
+        foreach ($i in $found) { if ($counts.ContainsKey($i.Cat)) { $counts[$i.Cat]++ } else { $counts[$i.Cat] = 1 } }
+        $groups = @{}
+        foreach ($c in ($counts.Keys | Sort-Object)) {
+            $groups[$c] = New-Object Windows.Forms.ListViewGroup($c, ('{0} ({1})' -f $c, $counts[$c]))
+            [void]$lv.Groups.Add($groups[$c])
+        }
+        foreach ($i in $found) {
+            $li = New-Object Windows.Forms.ListViewItem($i.Path)
+            [void]$li.SubItems.Add($i.Cat)
+            [void]$li.SubItems.Add($i.Why)
+            $li.Tag = $i
+            $li.Group = $groups[$i.Cat]
+            $li.Checked = ($i.Kind -ne 'Orphan')
+            [void]$lv.Items.Add($li)
+        }
+        $lv.EndUpdate(); Fit-Columns $lv
+        Write-Log ('Leftover scan finished: {0} item(s). Program folders are un-ticked: check each one before removing.' -f $found.Count)
+    }
+})
+
+$btnLoRun.Add_Click({
+    $sel = @($Pg.Leftovers.List.CheckedItems | ForEach-Object { $_.Tag })
+    if ($sel.Count -eq 0) { Show-Msg 'Nothing is selected. Press "Scan" first.'; return }
+    $orph = @($sel | Where-Object { $_.Kind -eq 'Orphan' }).Count
+    $msg = "Remove $($sel.Count) item(s)?"
+    if ($orph -gt 0) { $msg += "`n`n$orph program folder(s) are moved to WinCrow's quarantine folder, not deleted, so you can put them back." }
+    $msg += "`n`nBroken shortcuts and empty folders are deleted."
+    $ans = [Windows.Forms.MessageBox]::Show($msg, 'WinCrow', 'YesNo', 'Warning')
+    if ($ans -ne 'Yes') { return }
+    Invoke-Busy {
+        $done = @(Remove-Leftovers $sel)
+        foreach ($li in @($Pg.Leftovers.List.Items)) { if ($done -contains $li.Tag) { $li.Remove() } }
+        Write-Log ('Leftovers: {0} of {1} removed.' -f $done.Count, $sel.Count)
+    }
+})
+
+# ====================================================================== UPDATE UI
+function Show-UpdateDialog($rel) {
+    $notes = ([string]$rel.Notes -replace '\r', '').Trim()
+    if ($notes.Length -gt 700) { $notes = $notes.Substring(0, 700) + '...' }
+    $msg = "WinCrow $($rel.Version) is available. You have $AppVersion.`n`n"
+    if ($notes) { $msg += "What is new:`n$notes`n`n" }
+    $msg += "Yes = download and install now`nNo = open the GitHub page`nCancel = not now"
+    $ans = [Windows.Forms.MessageBox]::Show($msg, 'WinCrow update', 'YesNoCancel', 'Information')
+    if ($ans -eq 'Yes') {
+        Invoke-Busy {
+            try { Install-Update $rel }
+            catch {
+                Write-Log ('Update failed: ' + $_.Exception.Message) 'ERROR'
+                Show-Msg ("The update could not be installed:`n`n" + $_.Exception.Message) 'Warning'
+            }
+        }
+    } elseif ($ans -eq 'No') {
+        try { Start-Process $rel.Page } catch { }
+    }
+}
+
+function Show-UpdateResult($rel, [bool]$Manual) {
+    switch ($rel.State) {
+        'Newer' {
+            $script:PendingUpdate = $rel
+            $btnUpdate.Text = 'Update ' + $rel.Tag
+            $btnUpdate.Visible = $true
+            $lblUpdate.Text = "Version $($rel.Version) is available. You have $AppVersion."
+            Write-Log ('Update available: ' + $rel.Tag)
+            if ($Manual) { Show-UpdateDialog $rel }
+        }
+        'Current' {
+            $lblUpdate.Text = "You are up to date (version $AppVersion)."
+            if ($Manual) { Show-Msg "You are up to date.`n`nWinCrow $AppVersion is the latest version." }
+        }
+        'NoVersion' {
+            $lblUpdate.Text = 'No version.txt was found on GitHub yet, so there is nothing to compare with.'
+            if ($Manual) { Show-Msg 'No version.txt was found in the main branch of the GitHub project yet, so there is nothing to update to.' }
+        }
+        default {
+            $lblUpdate.Text = 'Could not check for updates.'
+            Write-Log ('Update check failed: ' + $rel.Msg) 'WARN'
+            if ($Manual) { Show-Msg ("Could not check for updates:`n`n" + $rel.Msg) 'Warning' }
+        }
+    }
+}
+
+$btnUpdate.Add_Click({ if ($script:PendingUpdate) { Show-UpdateDialog $script:PendingUpdate } })
+
+$btnCheckUpd.Add_Click({
+    $script:ManualRel = $null
+    Invoke-Busy {
+        Write-Log 'Checking GitHub for updates...'
+        $script:ManualRel = Read-Version (& $UpdateFetch $VersionUrl $UserAgent)
+    }
+    if ($script:ManualRel) { Show-UpdateResult $script:ManualRel $true }
+})
+$btnRepo.Add_Click({ try { Start-Process $RepoUrl } catch { } })
+
+# Silent check at startup, in a background job so the window never waits on the network
+function Start-AutoUpdateCheck {
+    if (-not $script:Settings.AutoUpdate) { return }
+    try {
+        $script:UpdJob = Start-Job -ScriptBlock $UpdateFetch -ArgumentList $VersionUrl, $UserAgent
+        $script:UpdTimer = New-Object Windows.Forms.Timer
+        $script:UpdTimer.Interval = 600
+        $script:UpdTimer.Add_Tick({
+            if ($script:UpdJob.State -in @('Completed', 'Failed', 'Stopped')) {
+                $script:UpdTimer.Stop()
+                try {
+                    $res = Receive-Job -Job $script:UpdJob -ErrorAction Stop | Select-Object -Last 1
+                    Show-UpdateResult (Read-Version $res) $false
+                } catch { }
+                Remove-Job -Job $script:UpdJob -Force -ErrorAction SilentlyContinue
+            }
+        })
+        $script:UpdTimer.Start()
+    } catch { }
+}
+
+$form.Add_FormClosing({
+    try { if ($script:UpdTimer) { $script:UpdTimer.Stop() } } catch { }
+    try { Get-Job | Remove-Job -Force -ErrorAction SilentlyContinue } catch { }
 })
 
 # ====================================================================== THEME SWITCHING
@@ -998,7 +1910,8 @@ function Apply-Theme([string]$Name) {
 $btnTheme.Add_Click({
     $next = $(if ($script:Theme -eq 'Dark') { 'Light' } else { 'Dark' })
     Apply-Theme $next
-    Save-Theme $next
+    $script:Settings.Theme = $next
+    Save-Settings
     Write-Log "$next theme on."
 })
 
@@ -1008,7 +1921,8 @@ $form.Add_Shown({
     Set-TitleBar
     Write-Log "WinCrow $AppVersion - $OsCaption (build $Build)"
     if ($FirstRun) { Write-Log "First launch: installed to $InstallDir and added to the Start menu. Next time, open WinCrow from Start." }
-    Invoke-Busy { Load-Debloat; Load-Startup; Load-Tweaks }
+    Invoke-Busy { Load-Debloat; Load-Cleaner; Load-Startup; Load-Tweaks }
+    Start-AutoUpdateCheck
 })
 
 Apply-Theme $script:Theme
