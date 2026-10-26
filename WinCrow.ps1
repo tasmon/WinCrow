@@ -30,7 +30,7 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference    = 'SilentlyContinue'
 
 $AppName      = 'WinCrow'
-$AppVersion   = '1.2.1'
+$AppVersion   = '1.2.2'
 $RepoOwner    = 'tasmon'
 $RepoName     = 'WinCrow'
 $RepoUrl      = "https://github.com/$RepoOwner/$RepoName"
@@ -46,6 +46,15 @@ $QuarantineDir = Join-Path $DataDir 'Quarantine'
 $RegBackupRoot = Join-Path $DataDir 'RegBackups'
 $ShortcutPath = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\WinCrow.lnk'
 $PsExe        = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+
+# Any error that stops WinCrow before or after the window opens is written to Logs\crash.log and shown,
+# because the app runs with a hidden console and would otherwise just disappear.
+trap {
+    $m = ('{0}  v{1}  {2}{3}{4}' -f (Get-Date), $AppVersion, ($_ | Out-String), $_.ScriptStackTrace, [Environment]::NewLine)
+    foreach ($d in @($LogDir, $env:TEMP)) { try { if (-not (Test-Path -LiteralPath $d)) { New-Item -ItemType Directory -Path $d -Force | Out-Null }; Add-Content -LiteralPath (Join-Path $d 'WinCrow-crash.log') -Value $m; break } catch { } }
+    try { Add-Type -AssemblyName System.Windows.Forms; [void][Windows.Forms.MessageBox]::Show(('WinCrow could not start:' + [Environment]::NewLine + [Environment]::NewLine + $_.Exception.Message + [Environment]::NewLine + [Environment]::NewLine + 'Details: ' + $LogDir + '\WinCrow-crash.log'), 'WinCrow', 'OK', 'Error') } catch { }
+    exit 1
+}
 
 # ------------------------------------------------------------------ elevation
 function Test-Admin {
