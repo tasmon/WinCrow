@@ -8,10 +8,14 @@ WinCrow is a single-file PowerShell tool with a dark-or-light GUI that strips Wi
 ![Platform: Windows 10 | 11](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-black)
 ![PowerShell 5.1](https://img.shields.io/badge/PowerShell-5.1-black)
 
-<!-- Add screenshots to docs/ and uncomment:
+---
 ![WinCrow dark theme](docs/screenshot-dark.png)
+
+---
+
 ![WinCrow light theme](docs/screenshot-light.png)
--->
+
+---
 
 ## Features
 
