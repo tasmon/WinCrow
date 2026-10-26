@@ -14,7 +14,7 @@
 
     Easiest: run "WinCrow Installer.cmd".
     Or:      powershell -ExecutionPolicy Bypass -File .\WinCrow.ps1
-    Remove:  Start menu app -> About -> Uninstall WinCrow   (or)   .\WinCrow.ps1 -Uninstall
+    Remove:  Windows Settings -> Apps -> Installed apps -> WinCrow -> Uninstall   (or)   .\WinCrow.ps1 -Uninstall
 
     Developer: Tasmon Islam <tasmon@outlook.com>
     NOTE: this file is plain ASCII on purpose so Windows PowerShell 5.1 reads it correctly.
@@ -30,7 +30,7 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference    = 'SilentlyContinue'
 
 $AppName      = 'WinCrow'
-$AppVersion   = '1.2.3'
+$AppVersion   = '1.2.5'
 $RepoOwner    = 'tasmon'
 $RepoName     = 'WinCrow'
 $RepoUrl      = "https://github.com/$RepoOwner/$RepoName"
@@ -52,7 +52,7 @@ $PsExe        = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\power
 trap {
     $m = ('{0}  v{1}  {2}{3}{4}' -f (Get-Date), $AppVersion, ($_ | Out-String), $_.ScriptStackTrace, [Environment]::NewLine)
     foreach ($d in @($LogDir, $env:TEMP)) { try { if (-not (Test-Path -LiteralPath $d)) { New-Item -ItemType Directory -Path $d -Force | Out-Null }; Add-Content -LiteralPath (Join-Path $d 'WinCrow-crash.log') -Value $m; break } catch { } }
-    try { Add-Type -AssemblyName System.Windows.Forms; [void][Windows.Forms.MessageBox]::Show(('WinCrow could not start:' + [Environment]::NewLine + [Environment]::NewLine + $_.Exception.Message + [Environment]::NewLine + [Environment]::NewLine + 'Details: ' + $LogDir + '\WinCrow-crash.log'), 'WinCrow', 'OK', 'Error') } catch { }
+    try { Add-Type -AssemblyName System.Windows.Forms; [void][Windows.Forms.MessageBox]::Show(('WinCrow could not start:' + [Environment]::NewLine + [Environment]::NewLine + $_.Exception.Message + [Environment]::NewLine + [Environment]::NewLine + $_.InvocationInfo.PositionMessage + [Environment]::NewLine + [Environment]::NewLine + 'Details: ' + $LogDir + '\WinCrow-crash.log'), 'WinCrow', 'OK', 'Error') } catch { }
     exit 1
 }
 
@@ -120,7 +120,7 @@ function Show-Msg([string]$Text, [string]$Icon = 'Information') {
 
 function Pt([double]$x, [double]$y) { New-Object Drawing.PointF([single]$x, [single]$y) }
 
-# The crow mark: a spiky black crow with a red eye on a blood-red disc (100x100 box)
+# The crow mark: a black crow perched on a branch, with a red eye, on a blood-red disc (100x100 box)
 function New-CrowBitmap([int]$Size) {
     $bmp = New-Object Drawing.Bitmap $Size, $Size
     $g = [Drawing.Graphics]::FromImage($bmp)
@@ -128,51 +128,42 @@ function New-CrowBitmap([int]$Size) {
     $g.Clear([Drawing.Color]::Transparent)
     $g.ScaleTransform($Size / 100.0, $Size / 100.0)
 
-    # blood-red disc
+    # blood-red disc with a dark ring
     $rect = New-Object Drawing.RectangleF 0, 0, 100, 100
     $disc = New-Object Drawing.Drawing2D.LinearGradientBrush $rect, (Hex '#E11D2E'), (Hex '#4A060C'), 55.0
     $g.FillEllipse($disc, 1, 1, 97, 97)
     $ringPen = New-Object Drawing.Pen (Hex '#0A0A0C'), 2.2
     $g.DrawEllipse($ringPen, 4, 4, 91, 91)
 
-    # crow (scaled into the disc)
-    $g.TranslateTransform(14, 14)
-    $g.ScaleTransform(0.72, 0.72)
-    $black = New-Object Drawing.Drawing2D.LinearGradientBrush $rect, (Hex '#2E3038'), (Hex '#030304'), 70.0
-    $edge  = New-Object Drawing.Pen (Hex '#000000'), 1.2
-    $edge.LineJoin = 'Miter'
-    $shapes = @(
-        @((Pt 52 44), (Pt 0 8),   (Pt 28 46)),     # wing blades
-        @((Pt 50 50), (Pt -2 34), (Pt 30 54)),
-        @((Pt 48 56), (Pt 4 62),  (Pt 32 63)),
-        @((Pt 40 66), (Pt 18 99), (Pt 52 73)),     # tail blades
-        @((Pt 48 68), (Pt 38 101),(Pt 62 75)),
-        @((Pt 54 44), (Pt 60 26), (Pt 82 34), (Pt 76 58))   # neck
-    )
-    foreach ($s in $shapes) {
-        $pts = [Drawing.PointF[]]$s
-        $g.FillPolygon($black, $pts)
-        $g.DrawPolygon($edge, $pts)
-    }
-    $g.FillEllipse($black, 36, 40, 40, 34)    # body
-    $g.FillEllipse($black, 58, 12, 26, 26)    # head
-    # hooked beak
-    $beak = New-Object Drawing.SolidBrush (Hex '#25262D')
-    $g.FillPolygon($beak, [Drawing.PointF[]]@((Pt 81 19), (Pt 99 31), (Pt 91 34), (Pt 97 48), (Pt 82 39)))
-    $hl = New-Object Drawing.Pen (Hex '#6B6E7A'), 1
-    $g.DrawLine($hl, 82, 20, 98, 31)
-    # glowing red eye
-    $glow = New-Object Drawing.SolidBrush ([Drawing.Color]::FromArgb(90, 255, 40, 40))
-    $g.FillEllipse($glow, 63, 15, 19, 17)
-    $eye = New-Object Drawing.SolidBrush (Hex '#FF2D2D')
-    $g.FillPolygon($eye, [Drawing.PointF[]]@((Pt 69 20), (Pt 79 22), (Pt 70 26)))
-    # talons
+    # branch
+    $branch = New-Object Drawing.Pen (Hex '#0A0A0C'), 3.2
+    $branch.StartCap = 'Round'; $branch.EndCap = 'Round'
+    $g.DrawLine($branch, 18, 78, 84, 74)
+
+    # crow silhouette facing right: hooked beak, rounded head, folded wing, long tail
+    $black = New-Object Drawing.Drawing2D.LinearGradientBrush $rect, (Hex '#2A2C33'), (Hex '#030304'), 70.0
+    $body = @((Pt 93 39), (Pt 80 30), (Pt 75 24), (Pt 68 20), (Pt 60 22), (Pt 55 29), (Pt 48 34), (Pt 38 40), (Pt 28 52),
+              (Pt 18 70), (Pt 12 84), (Pt 22 80), (Pt 26 86), (Pt 33 78), (Pt 40 76), (Pt 52 76), (Pt 62 68), (Pt 68 58),
+              (Pt 70 48), (Pt 77 44), (Pt 88 43))
+    $g.FillPolygon($black, [Drawing.PointF[]]$body)
+
+    # wing feathers
+    $feather = New-Object Drawing.Pen (Hex '#5A5D6A'), 1.3
+    $feather.StartCap = 'Round'; $feather.EndCap = 'Round'
+    $g.DrawLine($feather, 40, 46, 24, 70); $g.DrawLine($feather, 48, 50, 32, 74); $g.DrawLine($feather, 56, 54, 42, 76)
+
+    # legs
     $leg = New-Object Drawing.Pen (Hex '#0A0A0C'), 3
     $leg.StartCap = 'Round'; $leg.EndCap = 'Round'
-    $g.DrawLine($leg, 52, 72, 50, 90); $g.DrawLine($leg, 62, 70, 66, 90)
-    $g.DrawLine($leg, 42, 91, 52, 89); $g.DrawLine($leg, 58, 92, 70, 89)
+    $g.DrawLine($leg, 50, 75, 50, 77); $g.DrawLine($leg, 60, 70, 62, 75)
 
-    foreach ($o in @($disc, $ringPen, $black, $edge, $beak, $hl, $glow, $eye, $leg)) { $o.Dispose() }
+    # glowing red eye
+    $glow = New-Object Drawing.SolidBrush ([Drawing.Color]::FromArgb(90, 255, 40, 40))
+    $g.FillEllipse($glow, 63, 23, 9, 9)
+    $eye = New-Object Drawing.SolidBrush (Hex '#FF2D2D')
+    $g.FillEllipse($eye, 65, 25, 5, 5)
+
+    foreach ($o in @($disc, $ringPen, $branch, $black, $feather, $leg, $glow, $eye)) { $o.Dispose() }
     $g.Dispose()
     return $bmp
 }
@@ -211,15 +202,37 @@ function New-WinCrowShortcut {
     } catch { }
 }
 
+# Registers WinCrow in Windows "Installed apps" (Settings / Control Panel) so it can be removed from there
+$UninstallKey = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\WinCrow'
+function Register-WinCrow {
+    try {
+        New-Item -Path $UninstallKey -Force | Out-Null
+        $un = "`"$PsExe`" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$InstallDir\WinCrow.ps1`" -Uninstall"
+        $kb = 0
+        try { $kb = [int]((Get-ChildItem -LiteralPath $InstallDir -File -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum / 1KB) } catch { }
+        $str = @{
+            DisplayName = 'WinCrow'; DisplayVersion = $AppVersion; Publisher = $DevName
+            InstallLocation = $InstallDir; DisplayIcon = $IconPath; UninstallString = $un
+            URLInfoAbout = $RepoUrl; HelpLink = $RepoUrl; InstallDate = (Get-Date).ToString('yyyyMMdd')
+        }
+        foreach ($n in $str.Keys) { New-ItemProperty -Path $UninstallKey -Name $n -Value $str[$n] -PropertyType String -Force | Out-Null }
+        New-ItemProperty -Path $UninstallKey -Name NoModify -Value 1 -PropertyType DWord -Force | Out-Null
+        New-ItemProperty -Path $UninstallKey -Name NoRepair -Value 1 -PropertyType DWord -Force | Out-Null
+        New-ItemProperty -Path $UninstallKey -Name EstimatedSize -Value $kb -PropertyType DWord -Force | Out-Null
+    } catch { }
+}
+
 function Install-WinCrow {
     New-Item -ItemType Directory -Path $InstallDir, $LogDir -Force | Out-Null
     $dest = Join-Path $InstallDir 'WinCrow.ps1'
     if ($PSCommandPath -and ($PSCommandPath -ine $dest)) { Copy-Item -LiteralPath $PSCommandPath -Destination $dest -Force }
     Save-CrowIcon $IconPath
     New-WinCrowShortcut
+    Register-WinCrow
 }
 
 function Invoke-Uninstall {
+    Remove-Item -LiteralPath $UninstallKey -Recurse -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $ShortcutPath -Force -ErrorAction SilentlyContinue
     if (Test-Path -LiteralPath $InstallDir) {
         # the running script lives in that folder, so delete it a moment after we exit
@@ -252,6 +265,7 @@ if ($runningFrom -ine $InstallDir) {
     if (-not (Test-Path -LiteralPath $ShortcutPath) -or -not (Test-Path -LiteralPath $IconPath)) {
         try { Save-CrowIcon $IconPath; New-WinCrowShortcut } catch { }
     }
+    Register-WinCrow
 }
 if (-not (Test-Path -LiteralPath $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null }
 
@@ -377,6 +391,17 @@ $Rules = foreach ($l in ($RuleText -split "`r?`n")) {
 # Things Windows or the Store itself needs - never shown, never removed
 $ProtectRegex = '^(Microsoft\.(WindowsStore|StorePurchaseApp|DesktopAppInstaller|VCLibs|NET\.|UI\.Xaml|WindowsAppRuntime|SecHealthUI|WindowsTerminal|HEVCVideoExtension|HEIFImageExtension|WebpImageExtension|VP9VideoExtensions|WebMediaExtensions|AV1VideoExtension|MicrosoftEdge|LockApp|AAD\.|AccountsControl|AsyncTextService|BioEnrollment|CredDialogHost|ECApp|Win32WebViewHost|Windows\.(?!DevHome))|Windows\.|NVIDIACorp|RealtekSemiconductor|AdvancedMicroDevices|AppUp\.Intel)'
 
+# Readable name for an app that has no rule: drops the publisher id and splits CamelCase
+function Get-FriendlyName([string]$Pkg) {
+    $parts = @($Pkg -split '\.')
+    if ($parts.Count -gt 1 -and ($parts[0] -match '^\d' -or $parts[0] -match '^Microsoft(CorporationII)?$')) { $parts = $parts[1..($parts.Count - 1)] }
+    if ($parts.Count -eq 2 -and $parts[0] -eq $parts[1]) { $parts = @($parts[0]) }
+    $t = ($parts -join ' ')
+    $t = $t -creplace '(?<=[a-z0-9])(?=[A-Z])', ' '
+    $t = $t -creplace '(?<=[A-Z])(?=[A-Z][a-z])', ' '
+    return $t.Trim()
+}
+
 function Get-InstalledApps {
     $pk = Get-AppxPackage -AllUsers -ErrorAction SilentlyContinue | Where-Object {
         -not $_.IsFramework -and -not $_.NonRemovable -and $_.SignatureKind -ne 'System' -and $_.Name -notmatch $ProtectRegex
@@ -387,7 +412,7 @@ function Get-InstalledApps {
         foreach ($r in $Rules) { if ($nm -like $r.P) { $rule = $r; break } }
         [pscustomobject]@{
             Name  = $nm
-            Label = $(if ($rule) { $rule.L } else { $nm })
+            Label = $(if ($rule) { $rule.L } else { Get-FriendlyName $nm })
             Tier  = $(if ($rule) { $rule.T } else { 'X' })
             Full  = @($g.Group | ForEach-Object { $_.PackageFullName })
         }
@@ -1356,7 +1381,7 @@ $header.Add_Paint({
     $ty = [int](($s.Height - $stripe - ($t1.Height + $t3.Height - $tuck)) / 2)
     [Windows.Forms.TextRenderer]::DrawText($g, 'Win', $f1, (New-Object Drawing.Point($tx, $ty)), $C.Text, $fl)
     [Windows.Forms.TextRenderer]::DrawText($g, 'Crow', $f1, (New-Object Drawing.Point(($tx + $t1.Width), $ty)), $C.Accent, $fl)
-    [Windows.Forms.TextRenderer]::DrawText($g, $tag, $f2, (New-Object Drawing.Point(($tx + [int][Math]::Round(3 * $k)), ($ty + $t1.Height - $tuck))), $C.Dim, $fl)
+    [Windows.Forms.TextRenderer]::DrawText($g, $tag, $f2, (New-Object Drawing.Point($tx, ($ty + $t1.Height - $tuck))), $C.Dim, $fl)
     $r = New-Object Drawing.Rectangle(0, ($s.Height - $stripe), $s.Width, $stripe)
     $gb = New-Object Drawing.Drawing2D.LinearGradientBrush $r, $C.Accent, $C.Accent2, 0.0
     $g.FillRectangle($gb, $r)
@@ -1656,13 +1681,28 @@ $lnk.LinkColor = $C.Accent; $lnk.ActiveLinkColor = $C.Accent2; $lnk.VisitedLinkC
 $lnk.Add_Click({ try { Start-Process "mailto:$DevEmail" } catch { } })
 [void](Set-Role $lnk 'link')
 $about.Controls.Add($lnk)
-[void](New-AboutLabel ("Detected:    $OsCaption (build $Build)`r`nInstalled:   $InstallDir`r`nLogs:           $LogDir") 'Mono' 'sub' 16)
+$info = New-Object Windows.Forms.TableLayoutPanel
+$info.AutoSize = $true; $info.AutoSizeMode = 'GrowAndShrink'; $info.ColumnCount = 2; $info.RowCount = 3
+$info.Margin = New-Object Windows.Forms.Padding(3, 16, 3, 0)
+[void](Set-Role $info 'bg')
+$infoRow = 0
+foreach ($kv in @(@('Detected', "$OsCaption (build $Build)"), @('Installed', $InstallDir), @('Logs', $LogDir))) {
+    $kl = New-Object Windows.Forms.Label
+    $kl.Text = $kv[0]; $kl.AutoSize = $true; $kl.Font = Fnt 'Body'; $kl.Margin = New-Object Windows.Forms.Padding(0, 2, 24, 2)
+    [void](Set-Role $kl 'sub')
+    $vl = New-Object Windows.Forms.Label
+    $vl.Text = $kv[1]; $vl.AutoSize = $true; $vl.Font = Fnt 'Body'; $vl.Margin = New-Object Windows.Forms.Padding(0, 2, 0, 2)
+    [void](Set-Role $vl 'title')
+    $info.Controls.Add($kl, 0, $infoRow); $info.Controls.Add($vl, 1, $infoRow)
+    $infoRow++
+}
+$about.Controls.Add($info)
 $lblUpdate = New-AboutLabel "Version $AppVersion. Press Check for updates to look for a newer version." 'Body' 'sub' 14 $true
 $chkAuto = New-Object Windows.Forms.CheckBox
 $chkAuto.Text = 'Check for updates when WinCrow starts'
 $chkAuto.AutoSize = $true
 $chkAuto.Checked = [bool]$script:Settings.AutoUpdate
-$chkAuto.Margin = New-Object Windows.Forms.Padding(3, 8, 3, 0)
+$chkAuto.Margin = New-Object Windows.Forms.Padding(5, 8, 3, 0)
 $chkAuto.ForeColor = $C.Text
 [void](Set-Role $chkAuto 'bg')
 $chkAuto.Add_CheckedChanged({ $script:Settings.AutoUpdate = $chkAuto.Checked; Save-Settings })
@@ -1673,13 +1713,8 @@ $about.BringToFront()
 $btnCheckUpd  = New-Btn 'Check for updates' 'primary' 160
 $btnRepo      = New-Btn 'GitHub page' 'ghost' 110
 $btnOpenLogs  = New-Btn 'Open logs folder' 'ghost' 140
-$btnUninstall = New-Btn 'Uninstall WinCrow' 'danger' 150
-$Pg.About.Bar.Controls.AddRange(@($btnCheckUpd, $btnRepo, $btnOpenLogs, $btnUninstall))
+$Pg.About.Bar.Controls.AddRange(@($btnCheckUpd, $btnRepo, $btnOpenLogs))
 $btnOpenLogs.Add_Click({ Start-Process explorer.exe -ArgumentList "`"$LogDir`"" })
-$btnUninstall.Add_Click({
-    $ans = [Windows.Forms.MessageBox]::Show("Remove WinCrow, its Start menu shortcut and its folder?`n`n(Your Windows settings stay as they are, and your registry backups and quarantine folder in $DataDir are kept.)", 'WinCrow', 'YesNo', 'Question')
-    if ($ans -eq 'Yes') { Invoke-Uninstall; $form.Close() }
-})
 
 # ====================================================================== CLEANER PAGE
 $btnClRun     = New-Btn 'Clean selected' 'primary' 150

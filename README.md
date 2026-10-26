@@ -8,14 +8,10 @@ WinCrow is a single-file PowerShell tool with a dark-or-light GUI that strips Wi
 ![Platform: Windows 10 | 11](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-black)
 ![PowerShell 5.1](https://img.shields.io/badge/PowerShell-5.1-black)
 
----
+<!-- Add screenshots to docs/ and uncomment:
 ![WinCrow dark theme](docs/screenshot-dark.png)
-
----
-
 ![WinCrow light theme](docs/screenshot-light.png)
-
----
+-->
 
 ## Features
 
@@ -59,7 +55,7 @@ On first launch WinCrow installs itself the same way as the installer does.
 | **Leftovers** | Press **Scan**, review the list, press **Remove selected**. |
 | **Startup apps** | Untick anything you do not want at sign-in, press **Apply changes**. Takes effect at the next sign-in. |
 | **Tweaks** | Tick a tweak to apply it, untick to restore the Windows default, press **Apply changes**. File Explorer restarts automatically when a tweak needs it. |
-| **About** | Version, developer, **Check for updates**, log folder and **Uninstall WinCrow**. |
+| **About** | Version, developer, **Check for updates** and the log folder. |
 
 The sidebar button at the bottom switches between the dark and light theme. When a newer version exists, an **Update** button appears above it.
 
@@ -137,7 +133,7 @@ Tweaks that only apply to one Windows version are hidden on the other.
 
 ## Uninstall
 
-Run **`WinCrow Installer.cmd`** and choose **2**, or open WinCrow > **About** > **Uninstall WinCrow**, or run `.\WinCrow.ps1 -Uninstall`. This removes the program folder and the Start menu shortcut. It does not change your Windows settings, and it keeps `C:\ProgramData\WinCrow` (registry backups and quarantine) so you can still undo earlier clean-ups. Delete that folder yourself when you no longer need it. Untick your tweaks first if you want them reverted.
+Remove WinCrow like any other program: **Settings > Apps > Installed apps > WinCrow > Uninstall** (or Control Panel > Programs and Features). You can also run **`WinCrow Installer.cmd`** and choose **2**, or `.\WinCrow.ps1 -Uninstall`. This removes the program folder, the Start menu shortcut and the Installed apps entry. It does not change your Windows settings, and it keeps `C:\ProgramData\WinCrow` (registry backups and quarantine) so you can still undo earlier clean-ups. Delete that folder yourself when you no longer need it. Untick your tweaks first if you want them reverted.
 
 ## Requirements
 
