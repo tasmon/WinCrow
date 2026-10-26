@@ -30,7 +30,7 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference    = 'SilentlyContinue'
 
 $AppName      = 'WinCrow'
-$AppVersion   = '1.2.0'
+$AppVersion   = '1.2.1'
 $RepoOwner    = 'tasmon'
 $RepoName     = 'WinCrow'
 $RepoUrl      = "https://github.com/$RepoOwner/$RepoName"
@@ -75,6 +75,32 @@ try {
     Add-Type -Name Dwm -Namespace WinCrow -MemberDefinition '[System.Runtime.InteropServices.DllImport("dwmapi.dll")] public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref int val, int size);'
 } catch { }
 [Windows.Forms.Application]::EnableVisualStyles()
+
+# Display scale: 1.0 at 100%, 1.25 at 125% and so on. Sizes written for 96 DPI are scaled by WinForms,
+# but text is measured here so nothing is ever cut off at any scale.
+$script:K = 1.0
+try { $gdi = [Drawing.Graphics]::FromHwnd([IntPtr]::Zero); $script:K = [double]$gdi.DpiX / 96.0; $gdi.Dispose() } catch { }
+if ($script:K -lt 1.0) { $script:K = 1.0 }
+
+function Get-TextPx([string]$Text, [Drawing.Font]$Font) {
+    $fl = [Windows.Forms.TextFormatFlags]::NoPadding -bor [Windows.Forms.TextFormatFlags]::SingleLine
+    return [Windows.Forms.TextRenderer]::MeasureText($Text, $Font, (New-Object Drawing.Size(0, 0)), $fl)
+}
+
+# One type scale for the whole window. Sizes are in points, so Windows scales every one of them
+# by the same factor at any display scale (100%, 125%, 150%...) and the text stays consistent.
+$FontSpec = @{
+    Display = @('Segoe UI Black', 20)
+    Title   = @('Segoe UI Semibold', 15)
+    Nav     = @('Segoe UI Semibold', 10.5)
+    Strong  = @('Segoe UI Semibold', 10)
+    Body    = @('Segoe UI', 10)
+    Mono    = @('Consolas', 9.5)
+}
+function Fnt([string]$Kind) {
+    $f = $FontSpec[$Kind]
+    return (New-Object Drawing.Font($f[0], [single]$f[1]))
+}
 
 # ------------------------------------------------------------------ helpers
 function Hex([string]$x) { [Drawing.ColorTranslator]::FromHtml($x) }
@@ -1168,18 +1194,49 @@ function Style-Btn($b, [string]$Kind) {
 
 function New-Btn([string]$Text, [string]$Kind = 'ghost', [int]$W = 150) {
     $b = New-Object Windows.Forms.Button
+    $b.Font = Fnt 'Strong'
+    # width is in 96-DPI units; it grows to fit the label at any display scale
+    $need = [int][Math]::Ceiling((Get-TextPx $Text $b.Font).Width / $script:K) + 34
+    if ($need -gt $W) { $W = $need }
     $b.Text = $Text; $b.Width = $W; $b.Height = 36; $b.FlatStyle = 'Flat'; $b.Cursor = 'Hand'
-    $b.Font = New-Object Drawing.Font('Segoe UI Semibold', 9.5)
-    $b.Margin = New-Object Windows.Forms.Padding(0, 0, 10, 0)
+    $b.Margin = New-Object Windows.Forms.Padding(0, 0, 10, 6)
     Style-Btn $b $Kind
     [void](Set-Role $b "btn:$Kind")
     return $b
 }
 
+# The first column (names, paths) gets at least the width its text needs, up to 55% of the list.
+# The other columns share what is left in their given proportions.
+$script:Need0 = @{}
 function Fit-Columns($lv) {
     $w = $lv.ClientSize.Width - 6
-    $sum = ($lv.Tag | Measure-Object -Sum).Sum
-    for ($i = 0; $i -lt $lv.Columns.Count; $i++) { $lv.Columns[$i].Width = [int]($w * $lv.Tag[$i] / $sum) }
+    if ($w -lt 50) { return }
+    $ratio = $lv.Tag
+    $sum = ($ratio | Measure-Object -Sum).Sum
+    $n = $lv.Columns.Count
+    $w0 = [int]($w * $ratio[0] / $sum)
+    $need = $script:Need0[$lv]
+    if ($need -and $need -gt $w0) { $w0 = [int][Math]::Min($need, $w * 0.55) }
+    $lv.Columns[0].Width = $w0
+    $rsum = $sum - $ratio[0]
+    if ($n -lt 2 -or $rsum -le 0) { return }
+    $rest = $w - $w0
+    for ($i = 1; $i -lt $n; $i++) { $lv.Columns[$i].Width = [int]($rest * $ratio[$i] / $rsum) }
+}
+
+# Call after filling a list: measures the first column, adds a hover tip with the full row text where none is set, fits the columns
+function Finish-List($lv) {
+    $max = 0
+    foreach ($it in $lv.Items) {
+        $m = [Windows.Forms.TextRenderer]::MeasureText($it.Text, $lv.Font).Width
+        if ($m -gt $max) { $max = $m }
+        if (-not $it.ToolTipText) {
+            $parts = @($it.SubItems | ForEach-Object { $_.Text })
+            $it.ToolTipText = ($parts -join "`r`n")
+        }
+    }
+    $script:Need0[$lv] = $max + [int](40 * $script:K)
+    Fit-Columns $lv
 }
 
 function New-List([int[]]$Ratio) {
@@ -1187,8 +1244,9 @@ function New-List([int[]]$Ratio) {
     $lv.Dock = 'Fill'; $lv.View = 'Details'; $lv.CheckBoxes = $true; $lv.FullRowSelect = $true
     $lv.HeaderStyle = 'None'; $lv.BorderStyle = 'None'; $lv.MultiSelect = $false; $lv.ShowGroups = $true
     $lv.BackColor = $C.Panel; $lv.ForeColor = $C.Text
-    $lv.Font = New-Object Drawing.Font('Segoe UI', 10)
+    $lv.Font = Fnt 'Body'
     $lv.Tag = $Ratio
+    $lv.ShowItemToolTips = $true
     foreach ($r in $Ratio) { [void]$lv.Columns.Add('', 100) }
     $lv.Add_Resize({ param($s, $e) Fit-Columns $s })
     [void](Set-Role $lv 'list')
@@ -1205,16 +1263,32 @@ function New-Page([string]$Title, [string]$Sub, [int[]]$Ratio) {
     [void](Set-Role $cap 'bg')
     $t = New-Object Windows.Forms.Label
     $t.Text = $Title; $t.AutoSize = $true; $t.ForeColor = $C.Text
-    $t.Font = New-Object Drawing.Font('Segoe UI Semibold', 15); $t.Location = New-Object Drawing.Point(20, 8)
+    $t.Font = Fnt 'Title'; $t.Location = New-Object Drawing.Point(20, 8)
     [void](Set-Role $t 'title')
     $s = New-Object Windows.Forms.Label
-    $s.Text = $Sub; $s.AutoSize = $true; $s.ForeColor = $C.Dim
-    $s.Font = New-Object Drawing.Font('Segoe UI', 9.5); $s.Location = New-Object Drawing.Point(22, 40)
+    $s.Text = $Sub; $s.AutoSize = $false; $s.ForeColor = $C.Dim
+    $s.Font = Fnt 'Body'; $s.Location = New-Object Drawing.Point(22, 40); $s.Size = New-Object Drawing.Size(400, 20)
     [void](Set-Role $s 'sub')
     $cap.Controls.AddRange(@($t, $s))
+    $cap.Tag = @{ T = $t; S = $s }
+    # the subtitle wraps to the available width and the caption grows with it, at any display scale
+    $fitCap = {
+        param($cp, $ev)
+        if ($cp.ClientSize.Width -lt 50) { return }
+        $lt = $cp.Tag.T; $ls = $cp.Tag.S
+        $w = [Math]::Max(200, $cp.ClientSize.Width - $ls.Left - [int](20 * $script:K))
+        $ls.Top = $lt.Bottom + [int](2 * $script:K)
+        $m = [Windows.Forms.TextRenderer]::MeasureText($ls.Text, $ls.Font, (New-Object Drawing.Size(($w - [int](8 * $script:K)), 0)), [Windows.Forms.TextFormatFlags]::WordBreak)
+        $ls.Size = New-Object Drawing.Size($w, ($m.Height + [int](4 * $script:K)))
+        $h = $ls.Bottom + [int](8 * $script:K)
+        if ($cp.Height -ne $h) { $cp.Height = $h }
+    }
+    $cap.Add_Resize($fitCap)
+    $cap.Add_VisibleChanged($fitCap)
 
     $bar = New-Object Windows.Forms.FlowLayoutPanel
-    $bar.Dock = 'Bottom'; $bar.Height = 60; $bar.BackColor = $C.Bg; $bar.WrapContents = $false
+    $bar.Dock = 'Bottom'; $bar.BackColor = $C.Bg; $bar.WrapContents = $true
+    $bar.AutoSize = $true; $bar.AutoSizeMode = 'GrowAndShrink'
     $bar.Padding = New-Object Windows.Forms.Padding(20, 12, 10, 8)
     [void](Set-Role $bar 'bg')
 
@@ -1239,9 +1313,9 @@ $form = New-Object Windows.Forms.Form
 $form.Text = 'WinCrow'
 $form.StartPosition = 'CenterScreen'
 $form.Size = New-Object Drawing.Size(1060, 740)
-$form.MinimumSize = New-Object Drawing.Size(960, 620)
+$form.MinimumSize = New-Object Drawing.Size(900, 580)
 $form.BackColor = $C.Bg; $form.ForeColor = $C.Text
-$form.Font = New-Object Drawing.Font('Segoe UI', 9.5)
+$form.Font = Fnt 'Body'
 $form.AutoScaleDimensions = New-Object Drawing.SizeF(96, 96)
 $form.AutoScaleMode = 'Dpi'
 try { $form.Icon = [Drawing.Icon]::FromHandle((New-CrowBitmap 32).GetHicon()) } catch { }
@@ -1254,21 +1328,30 @@ $header.Dock = 'Top'; $header.Height = 78; $header.BackColor = $C.Panel
 $header.Add_Paint({
     param($s, $e)
     $g = $e.Graphics
-    $g.SmoothingMode = 'AntiAlias'; $g.InterpolationMode = 'HighQualityBicubic'; $g.TextRenderingHint = 'ClearTypeGridFit'
-    $g.DrawImage($script:LogoBmp, 16, 9, 58, 58)
-    $f1 = New-Object Drawing.Font('Segoe UI Black', 21)
-    $f2 = New-Object Drawing.Font('Segoe UI', 9.5)
-    $b1 = New-Object Drawing.SolidBrush $C.Text
-    $b2 = New-Object Drawing.SolidBrush $C.Dim
-    $b3 = New-Object Drawing.SolidBrush $C.Accent
-    $g.DrawString('Win', $f1, $b1, 82, 6)
-    $wWin = $g.MeasureString('Win', $f1).Width - 14
-    $g.DrawString('Crow', $f1, $b3, (82 + $wWin), 6)
-    $g.DrawString('Scavenge the bloat. Leave only bones.', $f2, $b2, 86, 48)
-    $r = New-Object Drawing.Rectangle(0, ($s.Height - 3), $s.Width, 3)
+    $k = $g.DpiX / 96.0
+    $g.SmoothingMode = 'AntiAlias'; $g.InterpolationMode = 'HighQualityBicubic'
+    $fl = [Windows.Forms.TextFormatFlags]::NoPadding -bor [Windows.Forms.TextFormatFlags]::SingleLine -bor [Windows.Forms.TextFormatFlags]::NoPrefix
+    $f1 = Fnt 'Display'
+    $f2 = Fnt 'Body'
+    $none = New-Object Drawing.Size(0, 0)
+    $tag = 'Scavenge the bloat. Leave only bones.'
+    $t1 = [Windows.Forms.TextRenderer]::MeasureText($g, 'Win', $f1, $none, $fl)
+    $t3 = [Windows.Forms.TextRenderer]::MeasureText($g, $tag, $f2, $none, $fl)
+    $stripe = [int][Math]::Ceiling(3 * $k)
+    $pad = [int][Math]::Round(10 * $k)
+    $logo = $s.Height - $stripe - 2 * $pad
+    $x0 = [int][Math]::Round(16 * $k)
+    $g.DrawImage($script:LogoBmp, $x0, $pad, $logo, $logo)
+    $tx = $x0 + $logo + [int][Math]::Round(12 * $k)
+    $tuck = [int][Math]::Round(4 * $k)
+    $ty = [int](($s.Height - $stripe - ($t1.Height + $t3.Height - $tuck)) / 2)
+    [Windows.Forms.TextRenderer]::DrawText($g, 'Win', $f1, (New-Object Drawing.Point($tx, $ty)), $C.Text, $fl)
+    [Windows.Forms.TextRenderer]::DrawText($g, 'Crow', $f1, (New-Object Drawing.Point(($tx + $t1.Width), $ty)), $C.Accent, $fl)
+    [Windows.Forms.TextRenderer]::DrawText($g, $tag, $f2, (New-Object Drawing.Point(($tx + [int][Math]::Round(3 * $k)), ($ty + $t1.Height - $tuck))), $C.Dim, $fl)
+    $r = New-Object Drawing.Rectangle(0, ($s.Height - $stripe), $s.Width, $stripe)
     $gb = New-Object Drawing.Drawing2D.LinearGradientBrush $r, $C.Accent, $C.Accent2, 0.0
     $g.FillRectangle($gb, $r)
-    foreach ($o in @($f1, $f2, $b1, $b2, $b3, $gb)) { $o.Dispose() }
+    $f1.Dispose(); $f2.Dispose(); $gb.Dispose()
 })
 
 # --- left navigation
@@ -1294,7 +1377,7 @@ foreach ($n in @(@{ K = 'Debloat'; T = '   Debloat' }, @{ K = 'Cleaner'; T = '  
     $b = New-Object Windows.Forms.Button
     $b.Text = $n.T; $b.Tag = $n.K; $b.TextAlign = 'MiddleLeft'; $b.FlatStyle = 'Flat'; $b.Cursor = 'Hand'
     $b.FlatAppearance.BorderSize = 0
-    $b.Font = New-Object Drawing.Font('Segoe UI Semibold', 11)
+    $b.Font = Fnt 'Nav'
     $b.Size = New-Object Drawing.Size(190, 44)
     $b.Location = New-Object Drawing.Point(0, (12 + $i * 46))
     $b.Add_Click({ param($s, $e) Show-Page $s.Tag })
@@ -1314,8 +1397,8 @@ $btnUpdate.Location = New-Object Drawing.Point(15, 376)
 $btnUpdate.Visible = $false
 $nav.Controls.Add($btnUpdate)
 $nav.Add_Resize({
-    $btnTheme.Location  = New-Object Drawing.Point(15, ($nav.ClientSize.Height - 52))
-    $btnUpdate.Location = New-Object Drawing.Point(15, ($nav.ClientSize.Height - 96))
+    $btnTheme.Location  = New-Object Drawing.Point($btnTheme.Left, ($nav.ClientSize.Height - $btnTheme.Height - [int](12 * $script:K)))
+    $btnUpdate.Location = New-Object Drawing.Point($btnUpdate.Left, ($btnTheme.Top - $btnUpdate.Height - [int](8 * $script:K)))
 })
 
 # --- main area
@@ -1340,7 +1423,7 @@ $script:LogBox = New-Object Windows.Forms.TextBox
 $script:LogBox.Dock = 'Bottom'; $script:LogBox.Height = 120; $script:LogBox.Multiline = $true; $script:LogBox.ReadOnly = $true
 $script:LogBox.ScrollBars = 'Vertical'; $script:LogBox.BorderStyle = 'None'
 $script:LogBox.BackColor = $C.LogBg; $script:LogBox.ForeColor = $C.LogFg
-$script:LogBox.Font = New-Object Drawing.Font('Consolas', 9)
+$script:LogBox.Font = Fnt 'Mono'
 [void](Set-Role $script:LogBox 'log')
 $main.Controls.Add($script:LogBox)
 
@@ -1380,7 +1463,7 @@ function Load-Debloat {
         [void]$lv.Items.Add($it)
     }
     $lv.EndUpdate()
-    Fit-Columns $lv
+    Finish-List $lv
     Write-Log ("Found {0} removable app(s)." -f $lv.Items.Count)
 }
 
@@ -1448,7 +1531,7 @@ function Load-Startup {
         $it.Checked = $e.Enabled
         [void]$lv.Items.Add($it)
     }
-    $lv.EndUpdate(); Fit-Columns $lv
+    $lv.EndUpdate(); Finish-List $lv
     Write-Log ("Found {0} startup entr{1}." -f $lv.Items.Count, $(if ($lv.Items.Count -eq 1) { 'y' } else { 'ies' }))
 }
 
@@ -1492,12 +1575,13 @@ function Load-Tweaks {
         $on = Test-Tweak $t
         $it = New-Object Windows.Forms.ListViewItem($t.Name)
         [void]$it.SubItems.Add($t.Desc)
+        $it.ToolTipText = $t.Desc
         $it.Tag = @{ T = $t; Was = $on }
         $it.Group = $groups[$t.Cat]
         $it.Checked = $on
         [void]$lv.Items.Add($it)
     }
-    $lv.EndUpdate(); Fit-Columns $lv
+    $lv.EndUpdate(); Finish-List $lv
     Write-Log ("{0} tweaks available for this PC." -f $lv.Items.Count)
 }
 
@@ -1524,40 +1608,52 @@ $btnTwkApply.Add_Click({
 })
 
 # ====================================================================== ABOUT PAGE
-$about = New-Object Windows.Forms.Panel
-$about.Dock = 'Fill'; $about.BackColor = $C.Bg
+$about = New-Object Windows.Forms.FlowLayoutPanel
+$about.Dock = 'Fill'; $about.FlowDirection = 'TopDown'; $about.WrapContents = $false; $about.AutoScroll = $true
+$about.BackColor = $C.Bg
+$about.Padding = New-Object Windows.Forms.Padding(17, 0, 17, 8)
 [void](Set-Role $about 'bg')
+$script:AboutWrap = New-Object System.Collections.ArrayList
 
-function New-AboutLabel([string]$Text, [string]$Font, [double]$Size, [string]$Role, [int]$X, [int]$Y, [int]$W = 0, [int]$H = 0) {
+function New-AboutLabel([string]$Text, [string]$Kind, [string]$Role, [int]$Top = 0, [bool]$Wrap = $false) {
     $l = New-Object Windows.Forms.Label
-    $l.Text = $Text; $l.Font = New-Object Drawing.Font($Font, $Size); $l.Location = New-Object Drawing.Point($X, $Y)
-    if ($W -gt 0) { $l.AutoSize = $false; $l.Size = New-Object Drawing.Size($W, $H) } else { $l.AutoSize = $true }
+    $l.Text = $Text; $l.Font = Fnt $Kind; $l.AutoSize = $true
+    $l.Margin = New-Object Windows.Forms.Padding(3, $Top, 3, 0)
     $l.ForeColor = $C.Text
+    if ($Wrap) { [void]$script:AboutWrap.Add($l) }
     [void](Set-Role $l $Role)
     $about.Controls.Add($l)
     return $l
 }
 
-[void](New-AboutLabel "WinCrow $AppVersion" 'Segoe UI Black' 20 'title' 20 6)
-[void](New-AboutLabel 'Scavenge the bloat. Leave only bones.' 'Segoe UI' 10.5 'accent' 23 46)
-[void](New-AboutLabel ('WinCrow strips Windows down to what you actually use: it removes bloated apps, controls what starts with Windows ' +
-                       'and flips the privacy, performance and interface switches that matter. Every change can be reversed from this window.') 'Segoe UI' 10.5 'title' 22 84 680 56)
-[void](New-AboutLabel 'DEVELOPER' 'Segoe UI Semibold' 9 'accent' 23 162)
-[void](New-AboutLabel $DevName 'Segoe UI Semibold' 16 'title' 21 182)
+# long labels wrap to the panel width, so no line can ever be cut off
+$fitAbout = {
+    $w = [Math]::Max(300, $about.ClientSize.Width - $about.Padding.Horizontal - [int](12 * $script:K))
+    foreach ($l in $script:AboutWrap) { $l.MaximumSize = New-Object Drawing.Size($w, 0) }
+}
+$about.Add_Resize($fitAbout)
+$about.Add_VisibleChanged($fitAbout)
+
+[void](New-AboutLabel "WinCrow $AppVersion" 'Display' 'title' 4)
+[void](New-AboutLabel 'Scavenge the bloat. Leave only bones.' 'Body' 'accent' 0)
+[void](New-AboutLabel ('WinCrow strips Windows down to what you actually use: it removes bloated apps, cleans junk files and registry clutter, ' +
+                       'controls what starts with Windows and flips the privacy, performance and interface switches that matter. Every change can be reversed from this window.') 'Body' 'title' 14 $true)
+[void](New-AboutLabel 'DEVELOPER' 'Strong' 'accent' 18)
+[void](New-AboutLabel $DevName 'Title' 'title' 0)
 $lnk = New-Object Windows.Forms.LinkLabel
-$lnk.Text = $DevEmail; $lnk.AutoSize = $true; $lnk.Location = New-Object Drawing.Point(23, 220)
-$lnk.Font = New-Object Drawing.Font('Segoe UI', 10.5); $lnk.Cursor = 'Hand'
+$lnk.Text = $DevEmail; $lnk.AutoSize = $true; $lnk.Margin = New-Object Windows.Forms.Padding(3, 0, 3, 0)
+$lnk.Font = Fnt 'Body'; $lnk.Cursor = 'Hand'
 $lnk.LinkColor = $C.Accent; $lnk.ActiveLinkColor = $C.Accent2; $lnk.VisitedLinkColor = $C.Accent; $lnk.LinkBehavior = 'HoverUnderline'
 $lnk.Add_Click({ try { Start-Process "mailto:$DevEmail" } catch { } })
 [void](Set-Role $lnk 'link')
 $about.Controls.Add($lnk)
-[void](New-AboutLabel ("Detected:    $OsCaption (build $Build)`r`nInstalled:   $InstallDir`r`nLogs:           $LogDir") 'Consolas' 9.5 'sub' 23 268 760 70)
-$lblUpdate = New-AboutLabel "Version $AppVersion. Press Check for updates to look for a newer version." 'Segoe UI' 10 'sub' 23 346
+[void](New-AboutLabel ("Detected:    $OsCaption (build $Build)`r`nInstalled:   $InstallDir`r`nLogs:           $LogDir") 'Mono' 'sub' 16)
+$lblUpdate = New-AboutLabel "Version $AppVersion. Press Check for updates to look for a newer version." 'Body' 'sub' 14 $true
 $chkAuto = New-Object Windows.Forms.CheckBox
 $chkAuto.Text = 'Check for updates when WinCrow starts'
 $chkAuto.AutoSize = $true
 $chkAuto.Checked = [bool]$script:Settings.AutoUpdate
-$chkAuto.Location = New-Object Drawing.Point(23, 378)
+$chkAuto.Margin = New-Object Windows.Forms.Padding(3, 8, 3, 0)
 $chkAuto.ForeColor = $C.Text
 [void](Set-Role $chkAuto 'bg')
 $chkAuto.Add_CheckedChanged({ $script:Settings.AutoUpdate = $chkAuto.Checked; Save-Settings })
@@ -1596,12 +1692,13 @@ function Load-Cleaner {
         $li = New-Object Windows.Forms.ListViewItem($it.Name)
         [void]$li.SubItems.Add($it.Desc)
         [void]$li.SubItems.Add('?')
+        $li.ToolTipText = $it.Desc
         $li.Tag = $it
         $li.Group = $groups[$it.Cat]
         $li.Checked = $it.On
         [void]$lv.Items.Add($li)
     }
-    $lv.EndUpdate(); Fit-Columns $lv
+    $lv.EndUpdate(); Finish-List $lv
 }
 
 $btnClAll.Add_Click({ foreach ($li in $Pg.Cleaner.List.Items) { $li.Checked = $true } })
@@ -1692,12 +1789,13 @@ $btnRgScan.Add_Click({
             $li = New-Object Windows.Forms.ListViewItem($i.Item)
             [void]$li.SubItems.Add($i.Path)
             [void]$li.SubItems.Add($i.Cat)
+            $li.ToolTipText = ([string]$i.Item + "`n" + [string]$i.Path)
             $li.Tag = $i
             $li.Group = $groups[$i.Cat]
             $li.Checked = $true
             [void]$lv.Items.Add($li)
         }
-        $lv.EndUpdate(); Fit-Columns $lv
+        $lv.EndUpdate(); Finish-List $lv
         Write-Log ('Registry scan finished: {0} issue(s) found.' -f $issues.Count)
     }
 })
@@ -1760,12 +1858,13 @@ $btnLoScan.Add_Click({
             $li = New-Object Windows.Forms.ListViewItem($i.Path)
             [void]$li.SubItems.Add($i.Cat)
             [void]$li.SubItems.Add($i.Why)
+            $li.ToolTipText = ([string]$i.Path + "`n" + [string]$i.Why)
             $li.Tag = $i
             $li.Group = $groups[$i.Cat]
             $li.Checked = ($i.Kind -ne 'Orphan')
             [void]$lv.Items.Add($li)
         }
-        $lv.EndUpdate(); Fit-Columns $lv
+        $lv.EndUpdate(); Finish-List $lv
         Write-Log ('Leftover scan finished: {0} item(s). Program folders are un-ticked: check each one before removing.' -f $found.Count)
     }
 })
@@ -1919,6 +2018,12 @@ $btnTheme.Add_Click({
 $form.Add_Shown({
     $form.Activate()
     Set-TitleBar
+    $wa = [Windows.Forms.Screen]::FromControl($form).WorkingArea
+    if ($form.Width -gt $wa.Width -or $form.Height -gt $wa.Height) {
+        $form.MinimumSize = New-Object Drawing.Size([Math]::Min($form.MinimumSize.Width, $wa.Width), [Math]::Min($form.MinimumSize.Height, $wa.Height))
+        $form.Size = New-Object Drawing.Size([Math]::Min($form.Width, $wa.Width), [Math]::Min($form.Height, $wa.Height))
+        $form.Location = New-Object Drawing.Point($wa.Left, $wa.Top)
+    }
     Write-Log "WinCrow $AppVersion - $OsCaption (build $Build)"
     if ($FirstRun) { Write-Log "First launch: installed to $InstallDir and added to the Start menu. Next time, open WinCrow from Start." }
     Invoke-Busy { Load-Debloat; Load-Cleaner; Load-Startup; Load-Tweaks }
