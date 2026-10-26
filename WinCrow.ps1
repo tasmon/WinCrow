@@ -30,7 +30,7 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference    = 'SilentlyContinue'
 
 $AppName      = 'WinCrow'
-$AppVersion   = '1.2.2'
+$AppVersion   = '1.2.3'
 $RepoOwner    = 'tasmon'
 $RepoName     = 'WinCrow'
 $RepoUrl      = "https://github.com/$RepoOwner/$RepoName"
@@ -87,9 +87,9 @@ try {
 
 # Display scale: 1.0 at 100%, 1.25 at 125% and so on. Sizes written for 96 DPI are scaled by WinForms,
 # but text is measured here so nothing is ever cut off at any scale.
-$script:K = 1.0
-try { $gdi = [Drawing.Graphics]::FromHwnd([IntPtr]::Zero); $script:K = [double]$gdi.DpiX / 96.0; $gdi.Dispose() } catch { }
-if ($script:K -lt 1.0) { $script:K = 1.0 }
+$script:DpiScale = 1.0
+try { $gdi = [Drawing.Graphics]::FromHwnd([IntPtr]::Zero); $script:DpiScale = [double]$gdi.DpiX / 96.0; $gdi.Dispose() } catch { }
+if ($script:DpiScale -lt 1.0) { $script:DpiScale = 1.0 }
 
 function Get-TextPx([string]$Text, [Drawing.Font]$Font) {
     $fl = [Windows.Forms.TextFormatFlags]::NoPadding -bor [Windows.Forms.TextFormatFlags]::SingleLine
@@ -1205,7 +1205,7 @@ function New-Btn([string]$Text, [string]$Kind = 'ghost', [int]$W = 150) {
     $b = New-Object Windows.Forms.Button
     $b.Font = Fnt 'Strong'
     # width is in 96-DPI units; it grows to fit the label at any display scale
-    $need = [int][Math]::Ceiling((Get-TextPx $Text $b.Font).Width / $script:K) + 34
+    $need = [int][Math]::Ceiling((Get-TextPx $Text $b.Font).Width / $script:DpiScale) + 34
     if ($need -gt $W) { $W = $need }
     $b.Text = $Text; $b.Width = $W; $b.Height = 36; $b.FlatStyle = 'Flat'; $b.Cursor = 'Hand'
     $b.Margin = New-Object Windows.Forms.Padding(0, 0, 10, 6)
@@ -1244,7 +1244,7 @@ function Finish-List($lv) {
             $it.ToolTipText = ($parts -join "`r`n")
         }
     }
-    $script:Need0[$lv] = $max + [int](40 * $script:K)
+    $script:Need0[$lv] = $max + [int](40 * $script:DpiScale)
     Fit-Columns $lv
 }
 
@@ -1285,11 +1285,11 @@ function New-Page([string]$Title, [string]$Sub, [int[]]$Ratio) {
         param($cp, $ev)
         if ($cp.ClientSize.Width -lt 50) { return }
         $lt = $cp.Tag.T; $ls = $cp.Tag.S
-        $w = [Math]::Max(200, $cp.ClientSize.Width - $ls.Left - [int](20 * $script:K))
-        $ls.Top = $lt.Bottom + [int](2 * $script:K)
-        $m = [Windows.Forms.TextRenderer]::MeasureText($ls.Text, $ls.Font, (New-Object Drawing.Size(($w - [int](8 * $script:K)), 0)), [Windows.Forms.TextFormatFlags]::WordBreak)
-        $ls.Size = New-Object Drawing.Size($w, ($m.Height + [int](4 * $script:K)))
-        $h = $ls.Bottom + [int](8 * $script:K)
+        $w = [Math]::Max(200, $cp.ClientSize.Width - $ls.Left - [int](20 * $script:DpiScale))
+        $ls.Top = $lt.Bottom + [int](2 * $script:DpiScale)
+        $m = [Windows.Forms.TextRenderer]::MeasureText($ls.Text, $ls.Font, (New-Object Drawing.Size(($w - [int](8 * $script:DpiScale)), 0)), [Windows.Forms.TextFormatFlags]::WordBreak)
+        $ls.Size = New-Object Drawing.Size($w, ($m.Height + [int](4 * $script:DpiScale)))
+        $h = $ls.Bottom + [int](8 * $script:DpiScale)
         if ($cp.Height -ne $h) { $cp.Height = $h }
     }
     $cap.Add_Resize($fitCap)
@@ -1406,8 +1406,8 @@ $btnUpdate.Location = New-Object Drawing.Point(15, 376)
 $btnUpdate.Visible = $false
 $nav.Controls.Add($btnUpdate)
 $nav.Add_Resize({
-    $btnTheme.Location  = New-Object Drawing.Point($btnTheme.Left, ($nav.ClientSize.Height - $btnTheme.Height - [int](12 * $script:K)))
-    $btnUpdate.Location = New-Object Drawing.Point($btnUpdate.Left, ($btnTheme.Top - $btnUpdate.Height - [int](8 * $script:K)))
+    $btnTheme.Location  = New-Object Drawing.Point($btnTheme.Left, ($nav.ClientSize.Height - $btnTheme.Height - [int](12 * $script:DpiScale)))
+    $btnUpdate.Location = New-Object Drawing.Point($btnUpdate.Left, ($btnTheme.Top - $btnUpdate.Height - [int](8 * $script:DpiScale)))
 })
 
 # --- main area
@@ -1637,7 +1637,7 @@ function New-AboutLabel([string]$Text, [string]$Kind, [string]$Role, [int]$Top =
 
 # long labels wrap to the panel width, so no line can ever be cut off
 $fitAbout = {
-    $w = [Math]::Max(300, $about.ClientSize.Width - $about.Padding.Horizontal - [int](12 * $script:K))
+    $w = [Math]::Max(300, $about.ClientSize.Width - $about.Padding.Horizontal - [int](12 * $script:DpiScale))
     foreach ($l in $script:AboutWrap) { $l.MaximumSize = New-Object Drawing.Size($w, 0) }
 }
 $about.Add_Resize($fitAbout)
