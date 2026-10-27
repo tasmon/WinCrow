@@ -30,7 +30,7 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference    = 'SilentlyContinue'
 
 $AppName      = 'WinCrow'
-$AppVersion   = '1.2.5'
+$AppVersion   = '1.2.6'
 $RepoOwner    = 'tasmon'
 $RepoName     = 'WinCrow'
 $RepoUrl      = "https://github.com/$RepoOwner/$RepoName"
@@ -1359,6 +1359,7 @@ $script:LogoBmp = New-CrowBitmap 160
 $header = New-Object Windows.Forms.Panel
 $header.Dock = 'Top'; $header.Height = 78; $header.BackColor = $C.Panel
 [void](Set-Role $header 'panel')
+$header.Add_Resize({ $header.Invalidate() })
 $header.Add_Paint({
     param($s, $e)
     $g = $e.Graphics
@@ -1377,11 +1378,12 @@ $header.Add_Paint({
     $x0 = [int][Math]::Round(16 * $k)
     $g.DrawImage($script:LogoBmp, $x0, $pad, $logo, $logo)
     $tx = $x0 + $logo + [int][Math]::Round(12 * $k)
-    $tuck = [int][Math]::Round(4 * $k)
-    $ty = [int](($s.Height - $stripe - ($t1.Height + $t3.Height - $tuck)) / 2)
+    $ty = [int](($s.Height - $stripe - $t1.Height) / 2)
+    $tyTag = [int](($s.Height - $stripe - $t3.Height) / 2)
+    $txTag = $s.Width - $t3.Width - [int][Math]::Round(24 * $k)
     [Windows.Forms.TextRenderer]::DrawText($g, 'Win', $f1, (New-Object Drawing.Point($tx, $ty)), $C.Text, $fl)
     [Windows.Forms.TextRenderer]::DrawText($g, 'Crow', $f1, (New-Object Drawing.Point(($tx + $t1.Width), $ty)), $C.Accent, $fl)
-    [Windows.Forms.TextRenderer]::DrawText($g, $tag, $f2, (New-Object Drawing.Point($tx, ($ty + $t1.Height - $tuck))), $C.Dim, $fl)
+    [Windows.Forms.TextRenderer]::DrawText($g, $tag, $f2, (New-Object Drawing.Point($txTag, $tyTag)), $C.Dim, $fl)
     $r = New-Object Drawing.Rectangle(0, ($s.Height - $stripe), $s.Width, $stripe)
     $gb = New-Object Drawing.Drawing2D.LinearGradientBrush $r, $C.Accent, $C.Accent2, 0.0
     $g.FillRectangle($gb, $r)
